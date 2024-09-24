@@ -1332,13 +1332,6 @@ enum {
 /* If set, XDP frames will be transmitted after processing */
 #define BPF_F_TEST_XDP_LIVE_FRAMES	(1U << 1)
 
-/* Flags for BPF_MAP_TYPE_PIFO_* */
-
-/* Used for flags argument of bpf_map_push_elem(); reserve top four bits for
- * actual flags, the rest is the enqueue priority
- */
-#define BPF_PIFO_PRIO_MASK	(~0ULL >> 4)
-
 /* type for BPF_ENABLE_STATS */
 enum bpf_stats_type {
 	/* enabled run_time_ns and run_cnt */

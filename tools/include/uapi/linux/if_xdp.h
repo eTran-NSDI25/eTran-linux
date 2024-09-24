@@ -33,10 +33,10 @@
 #define XDP_USE_SG     (1 << 4)
 
 /* For xdp_egress */
-#define XDP_XDP_EGRESS (1 << 5)
+#define XDP_EGRESS (1 << 5)
 
-/* For batch xdp */
-#define XDP_BATCH (1 << 6)
+/* For xdp_gen xdp */
+#define XDP_GEN (1 << 6)
 
 /* Flags for xsk_umem_config flags */
 #define XDP_UMEM_UNALIGNED_CHUNK_FLAG (1 << 0)

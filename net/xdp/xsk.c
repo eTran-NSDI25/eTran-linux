@@ -1490,7 +1490,7 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 
 	flags = sxdp->sxdp_flags;
 	if (flags & ~(XDP_SHARED_UMEM | XDP_COPY | XDP_ZEROCOPY |
-		      XDP_USE_NEED_WAKEUP | XDP_USE_SG | XDP_XDP_EGRESS | XDP_BATCH))
+		      XDP_USE_NEED_WAKEUP | XDP_USE_SG | XDP_EGRESS | XDP_GEN))
 		return -EINVAL;
 
 	bound_dev_if = READ_ONCE(sk->sk_bound_dev_if);
@@ -1633,7 +1633,7 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	xp_add_xsk(xs->pool, xs);
 
 	/* XDP_EGRESS */
-	if (xs->umem->zc && (flags & XDP_XDP_EGRESS)) {
+	if (xs->umem->zc && (flags & XDP_EGRESS)) {
 
         if (!ns_capable(net->user_ns, CAP_NET_RAW)) {
             err = -EPERM;
@@ -1652,7 +1652,7 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	}
 
 	/* XDP_GEN */
-	if (flags & XDP_BATCH) {
+	if (flags & XDP_GEN) {
 
         if (!ns_capable(net->user_ns, CAP_NET_RAW)) {
             err = -EPERM;

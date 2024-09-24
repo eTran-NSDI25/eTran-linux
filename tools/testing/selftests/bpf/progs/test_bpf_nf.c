@@ -9,6 +9,11 @@
 #define EINVAL 22
 #define ENOENT 2
 
+enum nf_nat_manip_type {
+	NF_NAT_MANIP_SRC,
+	NF_NAT_MANIP_DST
+};
+
 extern unsigned long CONFIG_HZ __kconfig;
 
 int test_einval_bpf_tuple = 0;

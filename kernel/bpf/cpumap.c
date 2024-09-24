@@ -24,6 +24,7 @@
 #include <linux/filter.h>
 #include <linux/ptr_ring.h>
 #include <net/xdp.h>
+#include <net/xsk_buff_pool.h> /* XSK load balancing */
 
 #include <linux/sched.h>
 #include <linux/workqueue.h>
@@ -178,9 +179,12 @@ static int cpu_map_bpf_prog_run_xdp(struct bpf_cpu_map_entry *rcpu,
 				    void **frames, int n,
 				    struct xdp_cpumap_stats *stats)
 {
+	struct xdp_rxq_info *orig_rxq;
 	struct xdp_rxq_info rxq;
 	struct xdp_buff xdp;
 	int i, nframes = 0;
+	struct xdp_buff *lb_xdp;
+	u32 cpu = rcpu->cpu;
 
 	xdp_set_return_frame_no_direct();
 	xdp.rxq = &rxq;
@@ -190,9 +194,51 @@ static int cpu_map_bpf_prog_run_xdp(struct bpf_cpu_map_entry *rcpu,
 		u32 act;
 		int err;
 
+		/* Load balancing */
+		lb_xdp = xdpf->xdp;
+		if (lb_xdp != NULL) {
+			// replace original rxq with new rxq as we need a new queue_index for load balancing
+			orig_rxq = lb_xdp->rxq;
+			lb_xdp->rxq = &rxq;
+			rxq.dev = orig_rxq->dev;
+			rxq.mem = orig_rxq->mem;
+			rxq.orig_queue_index = orig_rxq->queue_index;
+			rxq.queue_index = cpu;
+			act = bpf_prog_run_xdp(rcpu->prog, lb_xdp);
+			switch (act) {
+			case XDP_REDIRECT:
+				err = xdp_do_redirect(xdpf->dev_rx, lb_xdp,
+							rcpu->prog);
+
+				// restore original rxq
+				lb_xdp->rxq = orig_rxq;
+
+				if (unlikely(err)) {
+					xdp_return_lb_buff(lb_xdp);
+					stats->drop++;
+				} else {
+					stats->redirect++;
+				}
+				break;
+			default:
+				bpf_warn_invalid_xdp_action(NULL, rcpu->prog, act);
+				fallthrough;
+			case XDP_DROP:
+				// restore original rxq
+				lb_xdp->rxq = orig_rxq;
+
+				xdp_return_lb_buff(lb_xdp);
+				stats->drop++;
+				break;
+			}
+
+			continue;
+		}
+
 		rxq.dev = xdpf->dev_rx;
 		rxq.mem = xdpf->mem;
-		/* TODO: report queue_index to xdp_rxq_info */
+		/* report queue_index to xdp_rxq_info */
+		rxq.queue_index = xdpf->queue_index;
 
 		xdp_convert_frame_to_buff(xdpf, &xdp);
 
@@ -233,7 +279,7 @@ static int cpu_map_bpf_prog_run_xdp(struct bpf_cpu_map_entry *rcpu,
 	return nframes;
 }
 
-#define CPUMAP_BATCH 8
+#define CPUMAP_BATCH 24
 
 static int cpu_map_bpf_prog_run(struct bpf_cpu_map_entry *rcpu, void **frames,
 				int xdp_n, struct xdp_cpumap_stats *stats,
@@ -669,6 +715,7 @@ static void bq_flush_to_queue(struct xdp_bulk_queue *bq)
 	const int to_cpu = rcpu->cpu;
 	struct ptr_ring *q;
 	int i;
+	struct xdp_buff *lb_xdp;
 
 	if (unlikely(!bq->count))
 		return;
@@ -683,7 +730,12 @@ static void bq_flush_to_queue(struct xdp_bulk_queue *bq)
 		err = __ptr_ring_produce(q, xdpf);
 		if (err) {
 			drops++;
-			xdp_return_frame_rx_napi(xdpf);
+			if (xdpf->mem.type == MEM_TYPE_XSK_BUFF_POOL) {
+				lb_xdp = xdpf->xdp;
+				xdp_return_lb_buff(lb_xdp);
+			}
+			else
+				xdp_return_frame_rx_napi(xdpf);
 		}
 		processed++;
 	}

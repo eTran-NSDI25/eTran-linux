@@ -30,6 +30,10 @@ struct xdp_buff_xsk {
 	u64 orig_addr;
 	struct list_head free_list_node;
 	struct list_head xskb_list_node;
+	struct list_head lb_list_node;
+	bool is_egress;
+	/* xsk queueing */
+	u64 desc_addr;
 };
 
 #define XSK_CHECK_PRIV_TYPE(t) BUILD_BUG_ON(sizeof(t) > offsetofend(struct xdp_buff_xsk, cb))
@@ -56,27 +60,40 @@ struct xsk_buff_pool {
 	struct work_struct work;
 	struct list_head free_list;
 	struct list_head xskb_list;
+	struct list_head lb_list;
+	struct list_head lb_flush_node;
 	u32 heads_cnt;
 	u16 queue_id;
+
+	struct bpf_prog *xdp_gen_prog;
 
 	/* Data path members as close to free_heads at the end as possible. */
 	struct xsk_queue *fq ____cacheline_aligned_in_smp;
 	struct xsk_queue *cq;
+
+	struct bpf_prog *xdp_egress_prog;
+	struct xdp_rxq_info rxq;
+	struct xdp_txq_info txq;
+
 	/* For performance reasons, each buff pool has its own array of dma_pages
 	 * even when they are identical.
 	 */
 	dma_addr_t *dma_pages;
 	struct xdp_buff_xsk *heads;
+    struct xdp_buff_xsk *tx_heads;
 	struct xdp_desc *tx_descs;
 	u64 chunk_mask;
 	u64 addrs_cnt;
 	u32 free_list_cnt;
+    u32 xdp_egress_drop_cnt;
+	u32 lb_list_cnt;
 	u32 dma_pages_cnt;
 	u32 free_heads_cnt;
 	u32 headroom;
 	u32 chunk_size;
 	u32 chunk_shift;
 	u32 frame_len;
+    u8 xdp_egress_fwd;
 	u8 cached_need_wakeup;
 	bool uses_need_wakeup;
 	bool dma_need_sync;
@@ -87,6 +104,7 @@ struct xsk_buff_pool {
 	 * sockets share a single cq when the same netdev and queue id is shared.
 	 */
 	spinlock_t cq_lock;
+	spinlock_t lb_list_lock;
 	struct xdp_buff_xsk *free_heads[];
 };
 

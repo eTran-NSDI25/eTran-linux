@@ -617,6 +617,8 @@ static void mlx5e_free_xdpsq_desc(struct mlx5e_xdpsq *sq,
 		union mlx5e_xdp_info xdpi = mlx5e_xdpi_fifo_pop(xdpi_fifo);
 
 		switch (xdpi.mode) {
+		case MLX5E_XDP_XMIT_MODE_XSK_NO_COMP:
+			break;
 		case MLX5E_XDP_XMIT_MODE_FRAME: {
 			/* XDP_TX from the XSK RQ and XDP_REDIRECT */
 			struct xdp_frame *xdpf;
@@ -671,6 +673,13 @@ static void mlx5e_free_xdpsq_desc(struct mlx5e_xdpsq *sq,
 		case MLX5E_XDP_XMIT_MODE_XSK:
 			/* AF_XDP send */
 			(*xsk_frames)++;
+            break;
+		case MLX5E_XDP_XMIT_MODE_XSK_OOO_COMP:
+			/* AF_XDP send */
+			(*xsk_frames)++;
+			xdpi = mlx5e_xdpi_fifo_pop(xdpi_fifo);
+            /* Out-of-order completion */
+            xsk_ooo_cq(sq->channel->xsksq.xsk_pool->cq, xdpi.frame.desc_addr);
 			break;
 		default:
 			WARN_ON_ONCE(true);
@@ -735,8 +744,9 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
 
 	xdp_flush_frame_bulk(&bq);
 
+	/* sq->xsk_pool is valid */
 	if (xsk_frames)
-		xsk_tx_completed(sq->xsk_pool, xsk_frames);
+		xsk_tx_completed(sq->channel->xsksq.xsk_pool, xsk_frames);
 
 	sq->stats->cqes += i;
 
@@ -805,70 +815,97 @@ int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
 		struct xdp_frame *xdpf = frames[i];
 		dma_addr_t dma_arr[MAX_SKB_FRAGS];
 		struct mlx5e_xmit_data *xdptxd;
+		struct xsk_buff_pool *pool;
 		bool ret;
 
 		xdptxd = &xdptxdf.xd;
 		xdptxd->data = xdpf->data;
 		xdptxd->len = xdpf->len;
-		xdptxd->has_frags = xdp_frame_has_frags(xdpf);
-		xdptxd->dma_addr = dma_map_single(sq->pdev, xdptxd->data,
-						  xdptxd->len, DMA_TO_DEVICE);
 
-		if (unlikely(dma_mapping_error(sq->pdev, xdptxd->dma_addr)))
-			break;
+		/* xsk queueing */
+		if (xdpf->flags & XDP_FLAGS_XSK_QUEUEING) {
+			pool = xdpf->pool;
+			xdptxd->has_frags = 0;
+			xdptxd->dma_addr = xsk_buff_raw_get_dma(pool, xdpf->desc_addr);
+			xsk_buff_raw_dma_sync_for_device(pool, xdptxd->dma_addr, xdptxd->len);
+		} else {
+			xdptxd->has_frags = xdp_frame_has_frags(xdpf);
+			xdptxd->dma_addr = dma_map_single(sq->pdev, xdptxd->data,
+							xdptxd->len, DMA_TO_DEVICE);
+			if (unlikely(dma_mapping_error(sq->pdev, xdptxd->dma_addr)))
+				break;
 
-		if (xdptxd->has_frags) {
-			int j;
+			if (xdptxd->has_frags) {
+				int j;
 
-			xdptxdf.sinfo = xdp_get_shared_info_from_frame(xdpf);
-			xdptxdf.dma_arr = dma_arr;
-			for (j = 0; j < xdptxdf.sinfo->nr_frags; j++) {
-				skb_frag_t *frag = &xdptxdf.sinfo->frags[j];
+				xdptxdf.sinfo = xdp_get_shared_info_from_frame(xdpf);
+				xdptxdf.dma_arr = dma_arr;
+				for (j = 0; j < xdptxdf.sinfo->nr_frags; j++) {
+					skb_frag_t *frag = &xdptxdf.sinfo->frags[j];
 
-				dma_arr[j] = dma_map_single(sq->pdev, skb_frag_address(frag),
-							    skb_frag_size(frag), DMA_TO_DEVICE);
+					dma_arr[j] = dma_map_single(sq->pdev, skb_frag_address(frag),
+									skb_frag_size(frag), DMA_TO_DEVICE);
 
-				if (!dma_mapping_error(sq->pdev, dma_arr[j]))
-					continue;
-				/* mapping error */
-				while (--j >= 0)
-					dma_unmap_single(sq->pdev, dma_arr[j],
-							 skb_frag_size(&xdptxdf.sinfo->frags[j]),
-							 DMA_TO_DEVICE);
-				goto out;
+					if (!dma_mapping_error(sq->pdev, dma_arr[j]))
+						continue;
+					/* mapping error */
+					while (--j >= 0)
+						dma_unmap_single(sq->pdev, dma_arr[j],
+								skb_frag_size(&xdptxdf.sinfo->frags[j]),
+								DMA_TO_DEVICE);
+					goto out;
+				}
 			}
 		}
 
 		ret = INDIRECT_CALL_2(sq->xmit_xdp_frame, mlx5e_xmit_xdp_frame_mpwqe,
 				      mlx5e_xmit_xdp_frame, sq, xdptxd, 0);
-		if (unlikely(!ret)) {
-			int j;
 
-			dma_unmap_single(sq->pdev, xdptxd->dma_addr,
-					 xdptxd->len, DMA_TO_DEVICE);
-			if (!xdptxd->has_frags)
-				break;
-			for (j = 0; j < xdptxdf.sinfo->nr_frags; j++)
-				dma_unmap_single(sq->pdev, dma_arr[j],
-						 skb_frag_size(&xdptxdf.sinfo->frags[j]),
-						 DMA_TO_DEVICE);
+		if (unlikely(!ret)) {
+			if (!(xdpf->flags & XDP_FLAGS_XSK_QUEUEING)) {
+				int j;
+
+				dma_unmap_single(sq->pdev, xdptxd->dma_addr,
+						xdptxd->len, DMA_TO_DEVICE);
+				if (!xdptxd->has_frags)
+					break;
+				for (j = 0; j < xdptxdf.sinfo->nr_frags; j++)
+					dma_unmap_single(sq->pdev, dma_arr[j],
+							skb_frag_size(&xdptxdf.sinfo->frags[j]),
+							DMA_TO_DEVICE);
+			}
 			break;
 		}
+		if (xdpf->flags & XDP_FLAGS_XSK_QUEUEING) {
+            /* no AF_XDP completion event */
+            if ((xdpf->flags & XDP_FLAGS_XSK_QUEUEING_NO_COMP) ||
+                xdpf->pool->queue_id != sq_num)
+			    mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+				     (union mlx5e_xdp_info) { .mode = MLX5E_XDP_XMIT_MODE_XSK_NO_COMP });
+            else {
+                /* ooo AF_XDP completion event */
+                mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+				     (union mlx5e_xdp_info) { .mode = MLX5E_XDP_XMIT_MODE_XSK_OOO_COMP });
+                mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+                     (union mlx5e_xdp_info) { .frame.desc_addr = xdpf->desc_addr });
+            }
+		} else {
+			/* xmit_mode == MLX5E_XDP_XMIT_MODE_FRAME */
+			mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+						(union mlx5e_xdp_info) { .mode = MLX5E_XDP_XMIT_MODE_FRAME });
 
-		/* xmit_mode == MLX5E_XDP_XMIT_MODE_FRAME */
-		mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
-				     (union mlx5e_xdp_info) { .mode = MLX5E_XDP_XMIT_MODE_FRAME });
-		mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
-				     (union mlx5e_xdp_info) { .frame.xdpf = xdpf });
-		mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
-				     (union mlx5e_xdp_info) { .frame.dma_addr = xdptxd->dma_addr });
-		if (xdptxd->has_frags) {
-			int j;
+			mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+						(union mlx5e_xdp_info) { .frame.xdpf = xdpf });
+			mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+						(union mlx5e_xdp_info) { .frame.dma_addr = xdptxd->dma_addr });
+			if (xdptxd->has_frags) {
+				int j;
 
-			for (j = 0; j < xdptxdf.sinfo->nr_frags; j++)
-				mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
-						     (union mlx5e_xdp_info)
-						     { .frame.dma_addr = dma_arr[j] });
+				for (j = 0; j < xdptxdf.sinfo->nr_frags; j++)
+					mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+								(union mlx5e_xdp_info)
+								{ .frame.dma_addr = dma_arr[j] });
+			}
 		}
 		nxmit++;
 	}

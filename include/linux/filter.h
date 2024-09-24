@@ -664,6 +664,9 @@ struct bpf_redirect_info {
 
 DECLARE_PER_CPU(struct bpf_redirect_info, bpf_redirect_info);
 
+// bpf pacer
+DECLARE_PER_CPU(bool, bpf_pacer_need_wakeup);
+
 /* flags for bpf_redirect_info kern_flags */
 #define BPF_RI_F_RF_NO_DIRECT	BIT(0)	/* no napi_direct on return_frame */
 
@@ -1542,6 +1545,11 @@ int __bpf_xdp_store_bytes(struct xdp_buff *xdp, u32 offset, void *buf, u32 len);
 void *bpf_xdp_pointer(struct xdp_buff *xdp, u32 offset, u32 len);
 void bpf_xdp_copy_buf(struct xdp_buff *xdp, unsigned long off,
 		      void *buf, unsigned long len, bool flush);
+int __bpf_xdp_frame_load_bytes(struct xdp_frame *xdpf, u32 offset, void *buf, u32 len);
+int __bpf_xdp_frame_store_bytes(struct xdp_frame *xdpf, u32 offset, void *buf, u32 len);
+void *bpf_xdp_frame_pointer(struct xdp_frame *xdpf, u32 offset, u32 len);
+void bpf_xdp_copy_frame(struct xdp_frame *xdpf, unsigned long off,
+			void *buf, unsigned long len, bool flush);
 #else /* CONFIG_NET */
 static inline int __bpf_skb_load_bytes(const struct sk_buff *skb, u32 offset,
 				       void *to, u32 len)
@@ -1575,6 +1583,29 @@ static inline void *bpf_xdp_pointer(struct xdp_buff *xdp, u32 offset, u32 len)
 static inline void bpf_xdp_copy_buf(struct xdp_buff *xdp, unsigned long off, void *buf,
 				    unsigned long len, bool flush)
 {
+}
+
+static inline int __bpf_xdp_frame_load_bytes(struct xdp_frame *xdpf, u32 offset,
+					     void *buf, u32 len)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int __bpf_xdp_frame_store_bytes(struct xdp_frame *xdpf, u32 offset,
+					      void *buf, u32 len)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void *bpf_xdp_frame_pointer(struct xdp_frame *xdpf, u32 offset, u32 len)
+{
+	return NULL;
+}
+
+static inline void *bpf_xdp_copy_frame(struct xdp_frame *xdpf, long off, void *buf,
+				       unsigned long len, bool flush)
+{
+	return NULL;
 }
 #endif /* CONFIG_NET */
 

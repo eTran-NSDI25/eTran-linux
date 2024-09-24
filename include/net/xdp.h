@@ -60,6 +60,7 @@ struct page_pool;
 struct xdp_rxq_info {
 	struct net_device *dev;
 	u32 queue_index;
+	u32 orig_queue_index;
 	u32 reg_state;
 	struct xdp_mem_info mem;
 	unsigned int napi_id;
@@ -75,6 +76,8 @@ enum xdp_buff_flags {
 	XDP_FLAGS_FRAGS_PF_MEMALLOC	= BIT(1), /* xdp paged memory is under
 						   * pressure
 						   */
+	XDP_FLAGS_XSK_QUEUEING = BIT(2), /* used by xdp_egress for queueing */
+    XDP_FLAGS_XSK_QUEUEING_NO_COMP = BIT(3),
 };
 
 struct xdp_buff {
@@ -86,6 +89,7 @@ struct xdp_buff {
 	struct xdp_txq_info *txq;
 	u32 frame_sz; /* frame size to deduce data_hard_end/reserved tailroom*/
 	u32 flags; /* supported values defined in xdp_buff_flags */
+    u32 umem_id;
 };
 
 static __always_inline bool xdp_buff_has_frags(struct xdp_buff *xdp)
@@ -172,9 +176,23 @@ struct xdp_frame {
 	 * while mem info is valid on remote CPU.
 	 */
 	struct xdp_mem_info mem;
-	struct net_device *dev_rx; /* used by cpumap */
+	union {
+		struct net_device *dev_rx; /* used by cpumap */
+		struct xdp_frame *next; /* used by xdp queueing */
+	};
 	u32 frame_sz;
 	u32 flags; /* supported values defined in xdp_buff_flags */
+
+	struct xsk_buff_pool *pool;
+
+    /* only used by xsk queueing */
+	int tx_ifindex;
+	u64 desc_addr;
+
+	/* only used by load balancing */
+	struct xdp_buff *xdp;
+
+	u32 queue_index;
 };
 
 static __always_inline bool xdp_frame_has_frags(struct xdp_frame *frame)
@@ -240,6 +258,7 @@ void xdp_warn(const char *msg, const char *func, const int line);
 #define XDP_WARN(msg) xdp_warn(msg, __func__, __LINE__)
 
 struct xdp_frame *xdp_convert_zc_to_xdp_frame(struct xdp_buff *xdp);
+struct xdp_frame *xdp_convert_zc_to_xdp_frame_direct(struct xdp_buff *xdp, bool cpumap);
 struct sk_buff *__xdp_build_skb_from_frame(struct xdp_frame *xdpf,
 					   struct sk_buff *skb,
 					   struct net_device *dev);
@@ -285,6 +304,13 @@ int xdp_update_frame_from_buff(struct xdp_buff *xdp,
 	xdp_frame->frame_sz = xdp->frame_sz;
 	xdp_frame->flags = xdp->flags;
 
+	xdp_frame->pool = NULL;
+	xdp_frame->desc_addr = 0;
+	xdp_frame->tx_ifindex = 0;
+
+	xdp_frame->xdp = NULL;
+	xdp_frame->queue_index = xdp->rxq->queue_index;
+
 	return 0;
 }
 
@@ -293,9 +319,23 @@ static inline
 struct xdp_frame *xdp_convert_buff_to_frame(struct xdp_buff *xdp)
 {
 	struct xdp_frame *xdp_frame;
+	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
+	enum bpf_map_type map_type = ri->map_type;
 
-	if (xdp->rxq->mem.type == MEM_TYPE_XSK_BUFF_POOL)
-		return xdp_convert_zc_to_xdp_frame(xdp);
+	/* By default, we allocate a new page for xdp_frame and copy data, except for two cases:
+     *
+	 * case1: XDP_FLAGS_XSK_QUEUEING is set, the xdp_frame is built based on xdp_buff directly.
+     * There is no need for us to return the xdp_buff to buffer pool.
+	 *
+	 * case2: map_type is BPF_MAP_TYPE_CPUMAP, the xdp_frame is built based on xdp_buff directly,
+	 * we should return the xdp_buff to buffer pool.
+	*/
+	if (xdp->rxq->mem.type == MEM_TYPE_XSK_BUFF_POOL) {
+        if ((xdp->flags & XDP_FLAGS_XSK_QUEUEING) || map_type == BPF_MAP_TYPE_CPUMAP)
+			return xdp_convert_zc_to_xdp_frame_direct(xdp, map_type == BPF_MAP_TYPE_CPUMAP);
+		else
+			return xdp_convert_zc_to_xdp_frame(xdp);
+	}
 
 	/* Store info in top of packet */
 	xdp_frame = xdp->data_hard_start;
@@ -313,6 +353,7 @@ void __xdp_return(void *data, struct xdp_mem_info *mem, bool napi_direct,
 void xdp_return_frame(struct xdp_frame *xdpf);
 void xdp_return_frame_rx_napi(struct xdp_frame *xdpf);
 void xdp_return_buff(struct xdp_buff *xdp);
+void xdp_return_lb_buff(struct xdp_buff *xdp);
 void xdp_flush_frame_bulk(struct xdp_frame_bulk *bq);
 void xdp_return_frame_bulk(struct xdp_frame *xdpf,
 			   struct xdp_frame_bulk *bq);
@@ -495,4 +536,26 @@ static __always_inline u32 bpf_prog_run_xdp(const struct bpf_prog *prog,
 
 	return act;
 }
+
+/* XDP_GEN */
+#define MAX_XDP_GEN_PKT NAPI_POLL_WEIGHT
+#define XDP_GEN_FRAME_LEN 128
+
+struct xdp_gen_data {
+	struct xdp_rxq_info rxq;
+	struct net_device *dev;
+	struct page_pool *pp;
+	struct xdp_mem_info mem;
+};
+
+struct xdp_gen_page_head {
+	struct xdp_buff template_ctx;
+	struct xdp_buff ctx;
+	union {
+		/* ::data_hard_start starts here */
+		DECLARE_FLEX_ARRAY(struct xdp_frame, frame);
+		DECLARE_FLEX_ARRAY(u8, data);
+	};
+};
+
 #endif /* __LINUX_NET_XDP_H__ */

@@ -69,10 +69,19 @@ enum mlx5e_xdp_xmit_mode {
 	 * page. The UMEM Completion Ring producer pointer has to be increased.
 	 */
 	MLX5E_XDP_XMIT_MODE_XSK,
+
+    /* Generate out-of-order comp event */
+    MLX5E_XDP_XMIT_MODE_XSK_OOO_COMP,
+
+    /* Don't generate comp event */
+	MLX5E_XDP_XMIT_MODE_XSK_NO_COMP,
 };
 
 /* xmit_mode entry is pushed to the fifo per packet, followed by multiple
  * entries, as follows:
+ *
+ * MLX5E_XDP_XMIT_MODE_XSK_OOO_COMP:
+ * xdpf
  *
  * MLX5E_XDP_XMIT_MODE_FRAME:
  *    xdpf, dma_addr_1, dma_addr_2, ... , dma_addr_num.
@@ -81,8 +90,10 @@ enum mlx5e_xdp_xmit_mode {
  * MLX5E_XDP_XMIT_MODE_PAGE:
  *    num, page_1, page_2, ... , page_num.
  *
+ * MLX5E_XDP_XMIT_MODE_XSK_NO_COMP:
  * MLX5E_XDP_XMIT_MODE_XSK:
  *    none.
+ *
  */
 #define MLX5E_XDP_FIFO_ENTRIES2DS_MAX_RATIO 4
 
@@ -91,6 +102,7 @@ union mlx5e_xdp_info {
 	union {
 		struct xdp_frame *xdpf;
 		dma_addr_t dma_addr;
+        u64 desc_addr;
 	} frame;
 	union {
 		struct mlx5e_rq *rq;

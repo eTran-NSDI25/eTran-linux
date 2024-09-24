@@ -1117,6 +1117,7 @@ static int map_create(union bpf_attr *attr)
 	}
 
 	if (attr->map_type != BPF_MAP_TYPE_BLOOM_FILTER &&
+		attr->map_type != BPF_MAP_TYPE_PKT_QUEUE &&
 	    attr->map_extra != 0)
 		return -EINVAL;
 
@@ -1196,6 +1197,7 @@ static int map_create(union bpf_attr *attr)
 	case BPF_MAP_TYPE_DEVMAP:
 	case BPF_MAP_TYPE_DEVMAP_HASH:
 	case BPF_MAP_TYPE_XSKMAP:
+	case BPF_MAP_TYPE_PKT_QUEUE:
 		if (!capable(CAP_NET_ADMIN))
 			return -EPERM;
 		break;
@@ -2502,6 +2504,8 @@ static bool is_net_admin_prog_type(enum bpf_prog_type prog_type)
 	case BPF_PROG_TYPE_SCHED_CLS:
 	case BPF_PROG_TYPE_SCHED_ACT:
 	case BPF_PROG_TYPE_XDP:
+	case BPF_PROG_TYPE_XDP_EGRESS:
+	case BPF_PROG_TYPE_XDP_GEN:
 	case BPF_PROG_TYPE_LWT_IN:
 	case BPF_PROG_TYPE_LWT_OUT:
 	case BPF_PROG_TYPE_LWT_XMIT:
@@ -3712,6 +3716,10 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
 		return BPF_PROG_TYPE_SK_LOOKUP;
 	case BPF_XDP:
 		return BPF_PROG_TYPE_XDP;
+	case BPF_XDP_EGRESS:
+		return BPF_PROG_TYPE_XDP_EGRESS;
+	case BPF_XDP_GEN:
+		return BPF_PROG_TYPE_XDP_GEN;
 	case BPF_LSM_CGROUP:
 		return BPF_PROG_TYPE_LSM;
 	case BPF_TCX_INGRESS:
@@ -3792,6 +3800,14 @@ static int bpf_prog_attach_check_attach_type(const struct bpf_prog *prog,
 	 BPF_F_ID |		\
 	 BPF_F_LINK)
 
+int xdp_egress_bpf_prog_attach(const union bpf_attr *attr,
+			       struct bpf_prog *prog);
+int xdp_egress_bpf_prog_detach(const union bpf_attr *attr);
+
+int xdp_gen_bpf_prog_attach(const union bpf_attr *attr,
+			       struct bpf_prog *prog);
+int xdp_gen_bpf_prog_detach(const union bpf_attr *attr);
+
 static int bpf_prog_attach(const union bpf_attr *attr)
 {
 	enum bpf_prog_type ptype;
@@ -3852,6 +3868,12 @@ static int bpf_prog_attach(const union bpf_attr *attr)
 	case BPF_PROG_TYPE_SCHED_CLS:
 		ret = tcx_prog_attach(attr, prog);
 		break;
+	case BPF_PROG_TYPE_XDP_EGRESS:
+		xdp_egress_bpf_prog_attach(attr, prog);
+		break;
+	case BPF_PROG_TYPE_XDP_GEN:
+		xdp_gen_bpf_prog_attach(attr, prog);
+		break;
 	default:
 		ret = -EINVAL;
 	}
@@ -3909,6 +3931,12 @@ static int bpf_prog_detach(const union bpf_attr *attr)
 	case BPF_PROG_TYPE_SOCK_OPS:
 	case BPF_PROG_TYPE_LSM:
 		ret = cgroup_bpf_prog_detach(attr, ptype);
+		break;
+	case BPF_PROG_TYPE_XDP_EGRESS:
+		ret = xdp_egress_bpf_prog_detach(attr);
+		break;
+	case BPF_PROG_TYPE_XDP_GEN:
+		ret = xdp_gen_bpf_prog_detach(attr);
 		break;
 	case BPF_PROG_TYPE_SCHED_CLS:
 		ret = tcx_prog_detach(attr, prog);

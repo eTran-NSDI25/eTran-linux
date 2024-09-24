@@ -82,6 +82,8 @@ struct xdp_md;
 
 typedef u32 xdp_features_t;
 
+struct bpf_timer_nettx;
+
 void synchronize_net(void);
 void netdev_set_default_ethtool_ops(struct net_device *dev,
 				    const struct ethtool_ops *ops);
@@ -3203,6 +3205,7 @@ struct softnet_data {
 	struct Qdisc		*output_queue;
 	struct Qdisc		**output_queue_tailp;
 	struct sk_buff		*completion_queue;
+	struct bpf_timer_nettx	*bpf_timer;
 #ifdef CONFIG_XFRM_OFFLOAD
 	struct sk_buff_head	xfrm_backlog;
 #endif
@@ -3316,6 +3319,32 @@ static inline void netif_tx_start_all_queues(struct net_device *dev)
 }
 
 void netif_tx_wake_queue(struct netdev_queue *dev_queue);
+
+int bpf_pacer_main(void *data);
+
+void bpf_pacer_stop(void);
+
+#ifndef CONFIG_NET
+static inline void netif_tx_schedule_bpf_timer(struct bpf_timer_nettx *timer)
+{
+}
+
+static inline int netif_tx_schedule_bpf_timer_pacer(struct bpf_timer_nettx *timer)
+{
+}
+
+static inline int netif_tx_schedule_bpf_timer_pacer_wakeup(void)
+{
+}
+static inline int netif_tx_schedule_bpf_timer_pacer_continue(void)
+{
+}
+#else
+void netif_tx_schedule_bpf_timer(struct bpf_timer_nettx *timer);
+int netif_tx_schedule_bpf_timer_pacer(struct bpf_timer_nettx *timer);
+int netif_tx_schedule_bpf_timer_pacer_wakeup(void);
+int netif_tx_schedule_bpf_timer_pacer_continue(void);
+#endif
 
 /**
  *	netif_wake_queue - restart transmit

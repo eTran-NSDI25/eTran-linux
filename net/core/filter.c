@@ -35,6 +35,7 @@
 #include <net/ip.h>
 #include <net/protocol.h>
 #include <net/netlink.h>
+#include <net/xsk_buff_pool.h>
 #include <linux/skbuff.h>
 #include <linux/skmsg.h>
 #include <net/sock.h>
@@ -3899,28 +3900,18 @@ static const struct bpf_func_proto bpf_xdp_adjust_head_proto = {
 	.arg2_type	= ARG_ANYTHING,
 };
 
-void bpf_xdp_copy_buf(struct xdp_buff *xdp, unsigned long off,
-		      void *buf, unsigned long len, bool flush)
+static void bpf_xdp_copy_frags(struct skb_shared_info *sinfo,
+			       unsigned long ptr_len, u8 *ptr_buf,
+			       unsigned long off, void *buf,
+			       unsigned long len, bool flush)
 {
-	unsigned long ptr_len, ptr_off = 0;
 	skb_frag_t *next_frag, *end_frag;
-	struct skb_shared_info *sinfo;
+	unsigned long ptr_off = 0;
 	void *src, *dst;
-	u8 *ptr_buf;
 
-	if (likely(xdp->data_end - xdp->data >= off + len)) {
-		src = flush ? buf : xdp->data + off;
-		dst = flush ? xdp->data + off : buf;
-		memcpy(dst, src, len);
-		return;
-	}
-
-	sinfo = xdp_get_shared_info_from_buff(xdp);
 	end_frag = &sinfo->frags[sinfo->nr_frags];
 	next_frag = &sinfo->frags[0];
 
-	ptr_len = xdp->data_end - xdp->data;
-	ptr_buf = xdp->data;
 
 	while (true) {
 		if (off < ptr_off + ptr_len) {
@@ -3946,36 +3937,98 @@ void bpf_xdp_copy_buf(struct xdp_buff *xdp, unsigned long off,
 	}
 }
 
-void *bpf_xdp_pointer(struct xdp_buff *xdp, u32 offset, u32 len)
+void bpf_xdp_copy_buf(struct xdp_buff *xdp, unsigned long off,
+		      void *buf, unsigned long len, bool flush)
 {
-	u32 size = xdp->data_end - xdp->data;
-	struct skb_shared_info *sinfo;
-	void *addr = xdp->data;
+	void *src, *dst;
+
+	if (likely(xdp->data_end - xdp->data >= off + len)) {
+		src = flush ? buf : xdp->data + off;
+		dst = flush ? xdp->data + off : buf;
+		memcpy(dst, src, len);
+		return;
+	}
+
+	bpf_xdp_copy_frags(xdp_get_shared_info_from_buff(xdp),
+			   xdp->data_end - xdp->data,
+			   xdp->data,
+			   off, buf, len, flush);
+}
+
+void bpf_xdp_copy_frame(struct xdp_frame *xdp, unsigned long off,
+			void *buf, unsigned long len, bool flush)
+{
+	void *src, *dst;
+
+	if (likely(xdp->len >= off + len)) {
+		src = flush ? buf : xdp->data + off;
+		dst = flush ? xdp->data + off : buf;
+		memcpy(dst, src, len);
+		return;
+	}
+
+	bpf_xdp_copy_frags(xdp_get_shared_info_from_frame(xdp),
+			   xdp->len,
+			   xdp->data,
+			   off, buf, len, flush);
+}
+
+static void *__bpf_xdp_sinfo_pointer(struct skb_shared_info *sinfo, u32 offset,
+				     u32 len, void *addr)
+{
+	u32 frag_size = 0;
 	int i;
 
-	if (unlikely(offset > 0xffff || len > 0xffff))
-		return ERR_PTR(-EFAULT);
-
-	if (unlikely(offset + len > xdp_get_buff_len(xdp)))
+	if (offset + len > sinfo->xdp_frags_size)
 		return ERR_PTR(-EINVAL);
 
-	if (likely(offset < size)) /* linear area */
-		goto out;
-
-	sinfo = xdp_get_shared_info_from_buff(xdp);
-	offset -= size;
 	for (i = 0; i < sinfo->nr_frags; i++) { /* paged area */
-		u32 frag_size = skb_frag_size(&sinfo->frags[i]);
+		frag_size = skb_frag_size(&sinfo->frags[i]);
 
 		if  (offset < frag_size) {
 			addr = skb_frag_address(&sinfo->frags[i]);
-			size = frag_size;
 			break;
 		}
 		offset -= frag_size;
 	}
-out:
-	return offset + len <= size ? addr + offset : NULL;
+
+	return offset + len <= frag_size ? addr + offset : NULL;
+}
+
+void *bpf_xdp_pointer(struct xdp_buff *xdp, u32 offset, u32 len)
+{
+	u32 size = xdp->data_end - xdp->data;
+	void *addr = xdp->data;
+
+	if (unlikely(offset > 0xffff || len > 0xffff))
+		return ERR_PTR(-EFAULT);
+
+	if (offset < size) /* linear area */
+		return offset + len <= size ? addr + offset : NULL;
+
+	if (!xdp_buff_has_frags(xdp))
+		return ERR_PTR(-EINVAL);
+
+	return __bpf_xdp_sinfo_pointer(xdp_get_shared_info_from_buff(xdp),
+				       offset - size, len, addr);
+}
+
+void *bpf_xdp_frame_pointer(struct xdp_frame *xdp, u32 offset, u32 len)
+{
+	void *addr = xdp->data;
+	u32 size = xdp->len;
+
+	if (unlikely(offset > 0xffff || len > 0xffff))
+		return ERR_PTR(-EFAULT);
+
+	if (offset < size) /* linear area */
+		return offset + len <= size ? addr + offset : NULL;
+
+	if (!xdp_frame_has_frags(xdp))
+		return ERR_PTR(-EINVAL);
+
+	return __bpf_xdp_sinfo_pointer(xdp_get_shared_info_from_frame(xdp),
+				       offset - size, len, addr);
 }
 
 BPF_CALL_4(bpf_xdp_load_bytes, struct xdp_buff *, xdp, u32, offset,
@@ -4010,6 +4063,23 @@ int __bpf_xdp_load_bytes(struct xdp_buff *xdp, u32 offset, void *buf, u32 len)
 	return ____bpf_xdp_load_bytes(xdp, offset, buf, len);
 }
 
+int __bpf_xdp_frame_load_bytes(struct xdp_frame *xdp, u32 offset,
+			       void * buf, u32 len)
+{
+	void *ptr;
+
+	ptr = bpf_xdp_frame_pointer(xdp, offset, len);
+	if (IS_ERR(ptr))
+		return PTR_ERR(ptr);
+
+	if (!ptr)
+		bpf_xdp_copy_frame(xdp, offset, buf, len, false);
+	else
+		memcpy(buf, ptr, len);
+
+	return 0;
+}
+
 BPF_CALL_4(bpf_xdp_store_bytes, struct xdp_buff *, xdp, u32, offset,
 	   void *, buf, u32, len)
 {
@@ -4040,6 +4110,23 @@ static const struct bpf_func_proto bpf_xdp_store_bytes_proto = {
 int __bpf_xdp_store_bytes(struct xdp_buff *xdp, u32 offset, void *buf, u32 len)
 {
 	return ____bpf_xdp_store_bytes(xdp, offset, buf, len);
+}
+
+int __bpf_xdp_frame_store_bytes(struct xdp_frame *xdp, u32 offset,
+				void *buf, u32 len)
+{
+	void *ptr;
+
+	ptr = bpf_xdp_frame_pointer(xdp, offset, len);
+	if (IS_ERR(ptr))
+		return PTR_ERR(ptr);
+
+	if (!ptr)
+		bpf_xdp_copy_frame(xdp, offset, buf, len, true);
+	else
+		memcpy(ptr, buf, len);
+
+	return 0;
 }
 
 static int bpf_xdp_frags_increase_tail(struct xdp_buff *xdp, int offset)
@@ -4279,9 +4366,9 @@ static __always_inline int __xdp_do_redirect_frame(struct bpf_redirect_info *ri,
 						   struct bpf_prog *xdp_prog)
 {
 	enum bpf_map_type map_type = ri->map_type;
+	struct bpf_map *map = READ_ONCE(ri->map);
 	void *fwd = ri->tgt_value;
 	u32 map_id = ri->map_id;
-	struct bpf_map *map;
 	int err;
 
 	ri->map_id = 0; /* Valid map id idr range: [1,INT_MAX[ */
@@ -4292,21 +4379,33 @@ static __always_inline int __xdp_do_redirect_frame(struct bpf_redirect_info *ri,
 		goto err;
 	}
 
+	if (map)
+		WRITE_ONCE(ri->map, NULL);
+
 	switch (map_type) {
 	case BPF_MAP_TYPE_DEVMAP:
-		fallthrough;
 	case BPF_MAP_TYPE_DEVMAP_HASH:
-		map = READ_ONCE(ri->map);
 		if (unlikely(map)) {
-			WRITE_ONCE(ri->map, NULL);
 			err = dev_map_enqueue_multi(xdpf, dev, map,
 						    ri->flags & BPF_F_EXCLUDE_INGRESS);
 		} else {
 			err = dev_map_enqueue(fwd, xdpf, dev);
 		}
 		break;
+	case BPF_MAP_TYPE_PKT_QUEUE:
+        if (unlikely(!(xdpf->flags & XDP_FLAGS_XSK_QUEUEING))) {
+            err = -EINVAL;
+            break;
+        }
+		err = map ? pkt_queue_map_enqueue(map, xdpf, ri->tgt_index) : -EINVAL;
+		bool *need_wakeup = this_cpu_ptr(&bpf_pacer_need_wakeup);
+		*need_wakeup = true;
+		break;
 	case BPF_MAP_TYPE_CPUMAP:
 		err = cpu_map_enqueue(fwd, xdpf, dev);
+		/* we should add this pool to flush list to trigger FQ update. */
+		if (xdpf->mem.type == MEM_TYPE_XSK_BUFF_POOL)
+			add_lb_flush(xdpf->pool);
 		break;
 	case BPF_MAP_TYPE_UNSPEC:
 		if (map_id == INT_MAX) {
@@ -8890,6 +8989,8 @@ static bool xdp_is_valid_access(int off, int size,
 	case offsetof(struct xdp_md, data_end):
 		info->reg_type = PTR_TO_PACKET_END;
 		break;
+    case offsetof(struct xdp_md, umem_id):
+        return false;
 	}
 
 	return __is_valid_xdp_access(off, size);
@@ -10855,6 +10956,282 @@ const struct bpf_verifier_ops xdp_verifier_ops = {
 	.btf_struct_access	= xdp_btf_struct_access,
 };
 
+int xdp_gen_bpf_prog_attach(const union bpf_attr *attr,
+			       struct bpf_prog *prog)
+{
+	printk("xdp_gen_bpf_prog_attach\n");
+	return 0;
+}
+
+int xdp_gen_bpf_prog_detach(const union bpf_attr *attr)
+{
+	printk("xdp_gen_bpf_prog_detach\n");
+	return 0;
+}
+
+const struct bpf_prog_ops xdp_gen_prog_ops = {};
+
+static const struct bpf_func_proto *
+xdp_gen_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+{
+	switch (func_id) {
+	case BPF_FUNC_perf_event_output:
+		return &bpf_xdp_event_output_proto;
+	case BPF_FUNC_get_smp_processor_id:
+		return &bpf_get_smp_processor_id_proto;
+	case BPF_FUNC_csum_diff:
+		return &bpf_csum_diff_proto;
+	case BPF_FUNC_xdp_adjust_head:
+		return &bpf_xdp_adjust_head_proto;
+	case BPF_FUNC_xdp_adjust_meta:
+		return &bpf_xdp_adjust_meta_proto;
+	case BPF_FUNC_xdp_adjust_tail:
+		return &bpf_xdp_adjust_tail_proto;
+	case BPF_FUNC_xdp_get_buff_len:
+		return &bpf_xdp_get_buff_len_proto;
+	case BPF_FUNC_xdp_load_bytes:
+		return &bpf_xdp_load_bytes_proto;
+	case BPF_FUNC_xdp_store_bytes:
+		return &bpf_xdp_store_bytes_proto;
+	case BPF_FUNC_fib_lookup:
+		return &bpf_xdp_fib_lookup_proto;
+	case BPF_FUNC_check_mtu:
+		return &bpf_xdp_check_mtu_proto;
+	default:
+		return bpf_base_func_proto(func_id);
+	}
+}
+
+static bool xdp_gen_is_valid_access(int off, int size,
+				enum bpf_access_type type,
+				const struct bpf_prog *prog,
+				struct bpf_insn_access_aux *info)
+{
+    if (type == BPF_WRITE) {
+        return false;
+    }
+	switch (off) {
+	case offsetof(struct xdp_md, data):
+		info->reg_type = PTR_TO_PACKET;
+		break;
+	case offsetof(struct xdp_md, data_meta):
+		info->reg_type = PTR_TO_PACKET_META;
+		break;
+	case offsetof(struct xdp_md, data_end):
+		info->reg_type = PTR_TO_PACKET_END;
+		break;
+    case offsetof(struct xdp_md, umem_id):
+        return false;
+	}
+
+	return __is_valid_xdp_access(off, size);
+}
+
+static u32 xdp_gen_convert_ctx_access(enum bpf_access_type type,
+				  const struct bpf_insn *si,
+				  struct bpf_insn *insn_buf,
+				  struct bpf_prog *prog, u32 *target_size)
+{
+	struct bpf_insn *insn = insn_buf;
+
+	switch (si->off) {
+	case offsetof(struct xdp_md, data):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, data),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, data));
+		break;
+	case offsetof(struct xdp_md, data_meta):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, data_meta),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, data_meta));
+		break;
+	case offsetof(struct xdp_md, data_end):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, data_end),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, data_end));
+		break;
+	case offsetof(struct xdp_md, ingress_ifindex):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, rxq),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, rxq));
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_rxq_info, dev),
+				      si->dst_reg, si->dst_reg,
+				      offsetof(struct xdp_rxq_info, dev));
+		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
+				      offsetof(struct net_device, ifindex));
+		break;
+	case offsetof(struct xdp_md, rx_queue_index):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, rxq),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, rxq));
+		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
+				      offsetof(struct xdp_rxq_info,
+					       queue_index));
+		break;
+	case offsetof(struct xdp_md, egress_ifindex):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, txq),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, txq));
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_txq_info, dev),
+				      si->dst_reg, si->dst_reg,
+				      offsetof(struct xdp_txq_info, dev));
+		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
+				      offsetof(struct net_device, ifindex));
+		break;
+	}
+
+	return insn - insn_buf;
+}
+
+const struct bpf_verifier_ops xdp_gen_verifier_ops = {
+	.get_func_proto = xdp_gen_func_proto,
+	.is_valid_access = xdp_gen_is_valid_access,
+	.convert_ctx_access	= xdp_gen_convert_ctx_access,
+	.gen_prologue		= bpf_noop_prologue,
+	.btf_struct_access	= xdp_btf_struct_access,
+};
+
+int xdp_egress_bpf_prog_attach(const union bpf_attr *attr,
+			       struct bpf_prog *prog)
+{
+	printk("xdp_egress_bpf_prog_attach\n");
+	return 0;
+}
+
+int xdp_egress_bpf_prog_detach(const union bpf_attr *attr)
+{
+	printk("xdp_egress_bpf_prog_detach\n");
+	return 0;
+}
+
+const struct bpf_prog_ops xdp_egress_prog_ops = {};
+
+static const struct bpf_func_proto *
+xdp_egress_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+{
+	switch (func_id) {
+	case BPF_FUNC_perf_event_output:
+		return &bpf_xdp_event_output_proto;
+	case BPF_FUNC_get_smp_processor_id:
+		return &bpf_get_smp_processor_id_proto;
+	case BPF_FUNC_csum_diff:
+		return &bpf_csum_diff_proto;
+	case BPF_FUNC_xdp_adjust_head:
+		return &bpf_xdp_adjust_head_proto;
+	case BPF_FUNC_xdp_adjust_meta:
+		return &bpf_xdp_adjust_meta_proto;
+	case BPF_FUNC_redirect_map:
+		return &bpf_xdp_redirect_map_proto;
+	case BPF_FUNC_xdp_adjust_tail:
+		return &bpf_xdp_adjust_tail_proto;
+	case BPF_FUNC_xdp_get_buff_len:
+		return &bpf_xdp_get_buff_len_proto;
+	case BPF_FUNC_xdp_load_bytes:
+		return &bpf_xdp_load_bytes_proto;
+	case BPF_FUNC_xdp_store_bytes:
+		return &bpf_xdp_store_bytes_proto;
+	case BPF_FUNC_fib_lookup:
+		return &bpf_xdp_fib_lookup_proto;
+	case BPF_FUNC_check_mtu:
+		return &bpf_xdp_check_mtu_proto;
+	default:
+		return bpf_base_func_proto(func_id);
+	}
+}
+
+static bool xdp_egress_is_valid_access(int off, int size,
+				enum bpf_access_type type,
+				const struct bpf_prog *prog,
+				struct bpf_insn_access_aux *info)
+{
+    if (type == BPF_WRITE) {
+        return false;
+    }
+
+	switch (off) {
+	case offsetof(struct xdp_md, data):
+		info->reg_type = PTR_TO_PACKET;
+		break;
+	case offsetof(struct xdp_md, data_meta):
+		info->reg_type = PTR_TO_PACKET_META;
+		break;
+	case offsetof(struct xdp_md, data_end):
+		info->reg_type = PTR_TO_PACKET_END;
+		break;
+	}
+
+	return __is_valid_xdp_access(off, size);
+}
+
+static u32 xdp_egress_convert_ctx_access(enum bpf_access_type type,
+				  const struct bpf_insn *si,
+				  struct bpf_insn *insn_buf,
+				  struct bpf_prog *prog, u32 *target_size)
+{
+	struct bpf_insn *insn = insn_buf;
+
+	switch (si->off) {
+	case offsetof(struct xdp_md, data):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, data),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, data));
+		break;
+	case offsetof(struct xdp_md, data_meta):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, data_meta),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, data_meta));
+		break;
+	case offsetof(struct xdp_md, data_end):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, data_end),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, data_end));
+		break;
+	case offsetof(struct xdp_md, ingress_ifindex):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, rxq),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, rxq));
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_rxq_info, dev),
+				      si->dst_reg, si->dst_reg,
+				      offsetof(struct xdp_rxq_info, dev));
+		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
+				      offsetof(struct net_device, ifindex));
+		break;
+	case offsetof(struct xdp_md, rx_queue_index):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, rxq),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, rxq));
+		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
+				      offsetof(struct xdp_rxq_info,
+					       queue_index));
+		break;
+	case offsetof(struct xdp_md, egress_ifindex):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, txq),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, txq));
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_txq_info, dev),
+				      si->dst_reg, si->dst_reg,
+				      offsetof(struct xdp_txq_info, dev));
+		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
+				      offsetof(struct net_device, ifindex));
+		break;
+	case offsetof(struct xdp_md, umem_id):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, umem_id),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, umem_id));
+		break;
+	}
+
+	return insn - insn_buf;
+}
+
+const struct bpf_verifier_ops xdp_egress_verifier_ops = {
+	.get_func_proto = xdp_egress_func_proto,
+	.is_valid_access = xdp_egress_is_valid_access,
+	.convert_ctx_access	= xdp_egress_convert_ctx_access,
+	.gen_prologue		= bpf_noop_prologue,
+	.btf_struct_access	= xdp_btf_struct_access,
+};
+
 const struct bpf_prog_ops xdp_prog_ops = {
 	.test_run		= bpf_prog_test_run_xdp,
 };
@@ -11752,6 +12129,19 @@ __bpf_kfunc int bpf_dynptr_from_xdp(struct xdp_buff *xdp, u64 flags,
 
 	return 0;
 }
+
+__bpf_kfunc int bpf_dynptr_from_xdp_frame(struct xdp_frame *xdp, u64 flags,
+					  struct bpf_dynptr_kern *ptr__uninit)
+{
+	if (flags) {
+		bpf_dynptr_set_null(ptr__uninit);
+		return -EINVAL;
+	}
+
+	bpf_dynptr_init(ptr__uninit, xdp, BPF_DYNPTR_TYPE_XDP_FRAME, 0, xdp_get_frame_len(xdp));
+
+	return 0;
+}
 __diag_pop();
 
 int bpf_dynptr_from_skb_rdonly(struct sk_buff *skb, u64 flags,
@@ -11774,7 +12164,12 @@ BTF_SET8_END(bpf_kfunc_check_set_skb)
 
 BTF_SET8_START(bpf_kfunc_check_set_xdp)
 BTF_ID_FLAGS(func, bpf_dynptr_from_xdp)
+BTF_ID_FLAGS(func, bpf_dynptr_from_xdp_frame)
 BTF_SET8_END(bpf_kfunc_check_set_xdp)
+
+BTF_SET8_START(bpf_kfunc_check_set_xdp_egress)
+BTF_ID_FLAGS(func, bpf_dynptr_from_xdp_frame)
+BTF_SET8_END(bpf_kfunc_check_set_xdp_egress)
 
 static const struct btf_kfunc_id_set bpf_kfunc_set_skb = {
 	.owner = THIS_MODULE,
@@ -11784,6 +12179,11 @@ static const struct btf_kfunc_id_set bpf_kfunc_set_skb = {
 static const struct btf_kfunc_id_set bpf_kfunc_set_xdp = {
 	.owner = THIS_MODULE,
 	.set = &bpf_kfunc_check_set_xdp,
+};
+
+static const struct btf_kfunc_id_set bpf_kfunc_set_xdp_egress = {
+	.owner = THIS_MODULE,
+	.set = &bpf_kfunc_check_set_xdp_egress,
 };
 
 static int __init bpf_kfunc_init(void)
@@ -11800,7 +12200,9 @@ static int __init bpf_kfunc_init(void)
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_LWT_XMIT, &bpf_kfunc_set_skb);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_LWT_SEG6LOCAL, &bpf_kfunc_set_skb);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_NETFILTER, &bpf_kfunc_set_skb);
-	return ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &bpf_kfunc_set_xdp);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &bpf_kfunc_set_xdp);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP_GEN, &bpf_kfunc_set_xdp);
+	return ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP_EGRESS, &bpf_kfunc_set_xdp_egress);
 }
 late_initcall(bpf_kfunc_init);
 

@@ -22,11 +22,14 @@
 #include <linux/net.h>
 #include <linux/netdevice.h>
 #include <linux/rculist.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
 #include <linux/vmalloc.h>
 #include <net/xdp_sock_drv.h>
 #include <net/busy_poll.h>
 #include <net/netdev_rx_queue.h>
 #include <net/xdp.h>
+#include <net/page_pool/helpers.h>
 
 #include "xsk_queue.h"
 #include "xdp_umem.h"
@@ -35,6 +38,7 @@
 #define TX_BATCH_SIZE 32
 
 static DEFINE_PER_CPU(struct list_head, xskmap_flush_list);
+static DEFINE_PER_CPU(struct list_head, lb_flush_list);
 
 void xsk_set_rx_need_wakeup(struct xsk_buff_pool *pool)
 {
@@ -143,13 +147,18 @@ static int __xsk_rcv_zc(struct xdp_sock *xs, struct xdp_buff_xsk *xskb, u32 len,
 	int err;
 
 	addr = xp_get_handle(xskb);
+
+	if (xskb->is_egress)
+		flags |= XDP_EGRESS_FWD;
+
 	err = xskq_prod_reserve_desc(xs->rx, addr, len, flags);
 	if (err) {
 		xs->rx_queue_full++;
 		return err;
 	}
 
-	xp_release(xskb);
+	if (!xskb->is_egress)
+		xp_release(xskb);
 	return 0;
 }
 
@@ -311,8 +320,16 @@ static int xsk_rcv_check(struct xdp_sock *xs, struct xdp_buff *xdp, u32 len)
 	if (!xsk_is_bound(xs))
 		return -ENXIO;
 
-	if (xs->dev != xdp->rxq->dev || xs->queue_id != xdp->rxq->queue_index)
+	if (xs->dev != xdp->rxq->dev || xdp->rxq->queue_index != xs->queue_id)
 		return -EINVAL;
+
+	/* cpumap case */
+	if (xdp->rxq->orig_queue_index != U32_MAX) {
+		/* Check if orig queue is also bounded to the target XSK's UMEM. */
+		if (xdp->rxq->orig_queue_index >= MAX_UMEM_QUEUE_SIZE ||
+			!xs->umem->is_our_queue[xdp->rxq->orig_queue_index])
+			return -EINVAL;
+	}
 
 	if (len > xsk_pool_get_rx_frame_size(xs->pool) && !xs->sg) {
 		xs->rx_dropped++;
@@ -347,6 +364,7 @@ int xsk_generic_rcv(struct xdp_sock *xs, struct xdp_buff *xdp)
 
 static int xsk_rcv(struct xdp_sock *xs, struct xdp_buff *xdp)
 {
+	struct xdp_buff_xsk *xskb = container_of(xdp, struct xdp_buff_xsk, xdp);
 	u32 len = xdp_get_buff_len(xdp);
 	int err;
 
@@ -354,7 +372,8 @@ static int xsk_rcv(struct xdp_sock *xs, struct xdp_buff *xdp)
 	if (err)
 		return err;
 
-	if (xdp->rxq->mem.type == MEM_TYPE_XSK_BUFF_POOL) {
+	if (xskb->is_egress ||
+		xdp->rxq->mem.type == MEM_TYPE_XSK_BUFF_POOL) {
 		len = xdp->data_end - xdp->data;
 		return xsk_rcv_zc(xs, xdp, len);
 	}
@@ -373,23 +392,191 @@ int __xsk_map_redirect(struct xdp_sock *xs, struct xdp_buff *xdp)
 	err = xsk_rcv(xs, xdp);
 	if (err)
 		return err;
-
 	if (!xs->flush_node.prev)
 		list_add(&xs->flush_node, flush_list);
 
 	return 0;
 }
 
-void __xsk_map_flush(void)
+/* Page format:
+ *                           |                   frame_sz                |
+ *                           |       headroom         |
+ *		| template_ctx | ctx | struct xdp_frame | --- | ---- | --------- |
+ *      ^                    ^                        ^      ^
+ *  page_head          data_hard_start               data  data_end
+*/
+static void xdp_gen_init_page(struct page *page, void *arg)
+{
+	struct xdp_gen_page_head *page_head = phys_to_virt(page_to_phys(page));
+	struct xdp_gen_data *bxd = (struct xdp_gen_data *)arg;
+	u32 headroom = XDP_PACKET_HEADROOM;
+	size_t frm_len = XDP_GEN_FRAME_LEN;
+	size_t meta_len = 0;
+	struct xdp_buff *ctx = &page_head->ctx;
+	struct xdp_frame *frm = page_head->frame;
+	void *hard_start = page_head->data;
+
+	/* initialize struct xdp_buff ctx in this page */
+	xdp_init_buff(ctx, PAGE_SIZE - sizeof(struct xdp_gen_page_head), &bxd->rxq);
+	xdp_prepare_buff(ctx, hard_start, headroom, frm_len, true);
+	ctx->data = ctx->data_meta + meta_len;
+
+	xdp_update_frame_from_buff(ctx, frm);
+	frm->mem = ctx->rxq->mem;
+
+	memcpy(&page_head->template_ctx, ctx, sizeof(struct xdp_buff));
+}
+
+static bool xdp_gen_ctx_was_changed(struct xdp_gen_page_head *page_head)
+{
+	return page_head->template_ctx.data != page_head->ctx.data ||
+		page_head->template_ctx.data_meta != page_head->ctx.data_meta ||
+		page_head->template_ctx.data_end != page_head->ctx.data_end;
+}
+
+static void xdp_gen_reset_ctx(struct xdp_gen_page_head *page_head)
+{
+	if (!xdp_gen_ctx_was_changed(page_head))
+		return;
+
+	page_head->ctx.data = page_head->template_ctx.data;
+	page_head->ctx.data_meta = page_head->template_ctx.data_meta;
+	page_head->ctx.data_end = page_head->template_ctx.data_end;
+}
+
+static void __run_xdp_gen(struct xdp_gen_data *bxd, struct bpf_prog *xdp_gen_prog,
+				u32 repeat)
+{
+	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
+	struct xdp_gen_page_head *page_head;
+	struct page *page;
+	struct xdp_buff *ctx;
+	struct xdp_frame *frame;
+	int i, act;
+	unsigned int flush = 0;
+
+	/* The following code should be executed in bottom-half disabled,
+	 * we already in NAPI context.
+	*/
+	xdp_set_return_frame_no_direct();
+
+	for (i = 0; i < repeat; i++) {
+		page = page_pool_dev_alloc_pages(bxd->pp);
+		if (!page) {
+			pr_warn("Failed to allocate page for XDP_GEN\n");
+			goto out;
+		}
+
+		page_head = phys_to_virt(page_to_phys(page));
+
+		xdp_gen_reset_ctx(page_head);
+
+		ctx = &page_head->ctx;
+
+		act = bpf_prog_run(xdp_gen_prog, ctx);
+
+		switch (act) {
+			case XDP_TX:
+				/* emulate BPF_CALL_2(bpf_xdp_redirect, u32, ifindex, u64, flags) */
+				ri->tgt_index = bxd->dev->ifindex;
+				ri->map_id = INT_MAX;
+				ri->map_type = BPF_MAP_TYPE_UNSPEC;
+				fallthrough;
+			case XDP_REDIRECT:
+				frame = xdp_convert_buff_to_frame(ctx);
+				if (unlikely(xdp_do_redirect_frame(bxd->dev, ctx, frame, xdp_gen_prog)))
+					xdp_return_buff(ctx);
+				else
+					flush++;
+				break;
+			default:
+				pr_warn("Invalid action in XDP_GEN: %d\n", act);
+				fallthrough;
+			case XDP_ABORTED:
+			case XDP_DROP:
+				xdp_return_buff(ctx);
+				break;
+		}
+
+		/* there is no work to do, exit at once */
+		if (act == XDP_ABORTED)
+			break;
+
+        if (flush >= TX_BATCH_SIZE) {
+            __dev_flush();
+            flush = 0;
+        }
+	}
+out:
+	if (flush)
+		__dev_flush();
+
+	xdp_clear_return_frame_no_direct();
+}
+
+static void run_xdp_gen(struct xdp_sock *xs)
+{
+	struct bpf_prog *xdp_gen_prog = xs->pool->xdp_gen_prog;
+	struct xdp_gen_data *bxd = xs->bxd;
+
+	if (!xdp_gen_prog || !bxd)
+		return;
+
+	__run_xdp_gen(bxd, xdp_gen_prog, MAX_XDP_GEN_PKT);
+}
+
+void add_lb_flush(struct xsk_buff_pool *pool)
+{
+	struct list_head *flush_list = this_cpu_ptr(&lb_flush_list);
+	if (!pool->lb_flush_node.prev)
+		list_add(&pool->lb_flush_node, flush_list);
+}
+
+void __xsk_map_flush_raw(void)
 {
 	struct list_head *flush_list = this_cpu_ptr(&xskmap_flush_list);
-	struct xdp_sock *xs, *tmp;
 
+	struct xdp_sock *xs, *tmp;
 	list_for_each_entry_safe(xs, tmp, flush_list, flush_node) {
 		xsk_flush(xs);
 		__list_del_clearprev(&xs->flush_node);
 	}
 }
+
+void __xsk_map_flush(void)
+{
+	struct list_head *flush_list = this_cpu_ptr(&xskmap_flush_list);
+	struct xsk_buff_pool *pool, *pool_tmp;
+	bool xdp_gen = false;
+
+	struct xdp_sock *xs, *tmp;
+	list_for_each_entry_safe(xs, tmp, flush_list, flush_node) {
+		xsk_flush(xs);
+		// TODO: this should be done per netdev for multi-NIC case.
+		if (!xdp_gen) {
+			run_xdp_gen(xs);
+			xdp_gen = true;
+		}
+		__list_del_clearprev(&xs->flush_node);
+	}
+
+	/* When xsk load balancing is enabled, packets allocated
+	 * from this CPU's FQ are redirect to another CPU.
+	 * We should notify userspace to replenish the FQ.
+	*/
+	flush_list = this_cpu_ptr(&lb_flush_list);
+	list_for_each_entry_safe(pool, pool_tmp, flush_list, lb_flush_node) {
+		/* update fq pointer */
+		__xskq_cons_release(pool->fq);
+		__list_del_clearprev(&pool->lb_flush_node);
+	}
+}
+
+void xsk_ooo_cq(struct xsk_queue *cq, u64 addr)
+{
+    xskq_prod_write_addr_ooo(cq, addr);
+}
+EXPORT_SYMBOL(xsk_ooo_cq);
 
 void xsk_tx_completed(struct xsk_buff_pool *pool, u32 nb_entries)
 {
@@ -408,20 +595,146 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 			xs->sk.sk_write_space(&xs->sk);
 	}
 	rcu_read_unlock();
+
+    /* process dropped packets at XDP_EGRESS */
+    if (unlikely(pool->xdp_egress_drop_cnt)) {
+        xsk_tx_completed(pool, pool->xdp_egress_drop_cnt);
+        pool->xdp_egress_drop_cnt = 0;
+    }
+    /* process packets forwarded to another XSK */
+    if (unlikely(pool->xdp_egress_fwd)) {
+        __xsk_map_flush_raw();
+        pool->xdp_egress_fwd = 0;
+    }
+
+    /* wakeup bpf pacer if it has pending wakeup */
+	__bpf_pacer_flush();
+
 }
 EXPORT_SYMBOL(xsk_tx_release);
 
+enum xdp_egress_state {
+	XDP_EGRESS_DROP = 0,
+	XDP_EGRESS_REDIRECT_XSK = 1,
+    XDP_EGRESS_REDIRECT_MAP = 2,
+	XDP_EGRESS_TX = 3,
+};
+
+/*
+    *  |----------------------AF_XDP TX Frame Layout-------------------------|
+    *
+    *  |-------XDP_PACKET_HEADROOM-------|
+    *
+    *  |struct xdp_frame|################|---pool->headroom---|----packet----|
+    *  |---pool->headroom---|
+    *	                     ^	          ^                    ^    		  ^
+    *	         data_hard_start(void*)  data_meta(void*)	 data(void*)    data_end(void*)
+    *
+    *  orig_addr(u64)							         desc->addr(u64)
+    *
+    *
+    *	- XDP_PACKET_HEADROOM is defined as 256 in linux/bpf.h
+    *	- pool->headroom is provided by the user
+    *  very strange, xp_init_xskb_addr() set data_hard_start = orig_addr + pool->headroom, it is potential a BUG.
+*/
+
+static inline enum xdp_egress_state
+xdp_egress_handle(struct xsk_buff_pool *pool, struct xdp_desc *desc)
+{
+	struct bpf_prog *xdp_egress_prog = pool->xdp_egress_prog;
+	struct xdp_buff *xdp;
+	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
+	enum bpf_map_type map_type;
+	u32 ret;
+
+    /* xp_validate_desc() has already checked desc */
+
+    /* Locate the xskb from pre-allocated xskb pool (tx_heads) according to addr */
+    xdp = &pool->tx_heads[xp_aligned_extract_idx(pool, desc->addr)].xdp;
+
+    if (desc->options & XDP_EGRESS_NO_COMP)
+        xdp->flags |= XDP_FLAGS_XSK_QUEUEING_NO_COMP;
+    else
+        xdp->flags &= ~XDP_FLAGS_XSK_QUEUEING_NO_COMP;
+
+    /* clear options */
+    desc->options = 0;
+
+	net_prefetch(xdp->data);
+
+    /* xdp->data, xdp->data_hard_start are set in xp_create_and_assign_umem() and constant */
+    xdp->data_meta = xdp->data;
+    xdp->data_end = xdp->data + desc->len;
+    xdp->umem_id = pool->umem->id;
+
+	ret = bpf_prog_run(xdp_egress_prog, xdp);
+
+	switch (ret) {
+		case XDP_TX:
+			return XDP_EGRESS_TX;
+		case XDP_REDIRECT:
+			/* Record map_type before xdp_do_redirect() */
+			map_type = ri->map_type;
+			if (likely(map_type == BPF_MAP_TYPE_XSKMAP ||
+						map_type == BPF_MAP_TYPE_PKT_QUEUE)) {
+
+				if (unlikely(xdp_do_redirect(pool->netdev, xdp, xdp_egress_prog))) {
+                    pr_warn("XDP_EGRESS: xdp_do_redirect() failed\n");
+                    return XDP_EGRESS_DROP;
+                }
+
+                if ((xdp->flags & XDP_FLAGS_XSK_QUEUEING_NO_COMP) ||
+                    map_type == BPF_MAP_TYPE_XSKMAP) {
+				    /* We don't operate Completion Ring */
+				    xskq_prod_cancel_n(pool->cq, 1);
+                }
+
+                return map_type == BPF_MAP_TYPE_XSKMAP ? XDP_EGRESS_REDIRECT_XSK : XDP_EGRESS_REDIRECT_MAP;
+			}
+			pr_warn("XDP_EGRESS: unsupported map_type:%d\n", map_type);
+			fallthrough;
+		/* Invalid actions */
+		case XDP_ABORTED:
+			fallthrough;
+		case XDP_PASS:
+			fallthrough;
+		default:
+			pr_warn("XDP_EGRESS: unsupported action:%u\n", ret);
+			fallthrough;
+		case XDP_DROP:
+			return XDP_EGRESS_DROP;
+	}
+}
+
+bool xsk_tx_skip_desc(struct xdp_desc *desc)
+{
+    if (desc->options & XDP_EGRESS_SKIP)
+        return true;
+    return false;
+}
+EXPORT_SYMBOL(xsk_tx_skip_desc);
+
 bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc)
 {
+    bool budget_exhausted = false;
 	struct xdp_sock *xs;
+	enum xdp_egress_state ret;
 
 	rcu_read_lock();
+
+again:
 	list_for_each_entry_rcu(xs, &pool->xsk_tx_list, tx_list) {
+        if (xs->tx_budget_spent >= TX_BATCH_SIZE) {
+            budget_exhausted = true;
+            continue;
+        }
 		if (!xskq_cons_peek_desc(xs->tx, desc, pool)) {
 			if (xskq_has_descs(xs->tx))
 				xskq_cons_release(xs->tx);
 			continue;
 		}
+
+        xs->tx_budget_spent++;
 
 		/* This is the backpressure mechanism for the Tx path.
 		 * Reserve space in the completion queue and only proceed
@@ -431,10 +744,35 @@ bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc)
 		if (xskq_prod_reserve_addr(pool->cq, desc->addr))
 			goto out;
 
+        if (pool->xdp_egress_prog) {
+            ret = xdp_egress_handle(pool, desc);
+            if (likely(ret == XDP_EGRESS_TX || ret == XDP_EGRESS_REDIRECT_XSK || ret == XDP_EGRESS_REDIRECT_MAP)) {
+                /* xsk_tx_release() should call __xsk_map_flush_raw() to process this */
+                if (ret == XDP_EGRESS_REDIRECT_XSK)
+                    pool->xdp_egress_fwd = 1;
+                desc->options |= (ret == XDP_EGRESS_TX ? 0 : XDP_EGRESS_SKIP);
+            } else if (unlikely(ret == XDP_EGRESS_DROP)) {
+                /* add dropped frames to comp ring directly */
+                xsk_ooo_cq(pool->cq, desc->addr);
+                /* xsk_tx_release() should call xsk_tx_completed() to process this */
+                pool->xdp_egress_drop_cnt++;
+                desc->options |= XDP_EGRESS_SKIP;
+            } else {
+                pr_warn("BUG in XDP_EGRESS: %u\n", ret);
+            }
+        }
 		xskq_cons_release(xs->tx);
 		rcu_read_unlock();
+
 		return true;
 	}
+
+    if (budget_exhausted) {
+        list_for_each_entry_rcu(xs, &pool->xsk_tx_list, tx_list)
+            xs->tx_budget_spent = 0;
+        budget_exhausted = false;
+        goto again;
+    }
 
 out:
 	rcu_read_unlock();
@@ -1041,6 +1379,14 @@ static int xsk_release(struct socket *sock)
 
 	xsk_delete_from_maps(xs);
 	mutex_lock(&xs->mutex);
+
+	/* Release XDP_GEN resources binding to this socket */
+	if (xs->bxd) {
+		xdp_unreg_mem_model(&xs->bxd->mem);
+		page_pool_destroy(xs->bxd->pp);
+		kfree(xs->bxd);
+	}
+
 	xsk_unbind_dev(xs);
 	mutex_unlock(&xs->mutex);
 
@@ -1079,6 +1425,53 @@ static bool xsk_validate_queues(struct xdp_sock *xs)
 	return xs->fq_tmp && xs->cq_tmp;
 }
 
+static int init_xdp_gen(struct xdp_sock *xs)
+{
+	int err = -ENOMEM;
+	struct xdp_gen_data *bxd;
+	struct page_pool *pp;
+	struct net_device *netdev = xs->pool->netdev;
+	u32 queue_id = (u32)xs->queue_id;
+
+	xs->bxd = kzalloc(sizeof(struct xdp_gen_data), GFP_KERNEL);
+	if (!xs->bxd)
+		return err;
+
+	bxd = xs->bxd;
+
+	struct page_pool_params pp_params = {
+		.order = 0,
+		.flags = 0,
+		.pool_size = MAX_XDP_GEN_PKT << 1,
+		.nid = dev_to_node(xs->pool->dev),
+		.init_callback = xdp_gen_init_page,
+		.init_arg = bxd,
+	};
+
+	pp = page_pool_create(&pp_params);
+	if (IS_ERR(pp))
+		goto err_1;
+
+	err = xdp_reg_mem_model(&bxd->mem, MEM_TYPE_PAGE_POOL, pp);
+	if (err)
+		goto err_2;
+
+	bxd->pp = pp;
+
+	xdp_rxq_info_reg(&bxd->rxq, netdev, queue_id, 0);
+
+	bxd->rxq.mem.type = MEM_TYPE_PAGE_POOL;
+	bxd->rxq.mem.id = pp->xdp_mem_id;
+	bxd->dev = netdev;
+
+	return 0;
+err_2:
+	page_pool_destroy(pp);
+err_1:
+	kfree(bxd);
+	return err;
+}
+
 static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 {
 	struct sockaddr_xdp *sxdp = (struct sockaddr_xdp *)addr;
@@ -1088,6 +1481,7 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	int bound_dev_if;
 	u32 flags, qid;
 	int err = 0;
+    struct net *net = sock_net(sk);
 
 	if (addr_len < sizeof(struct sockaddr_xdp))
 		return -EINVAL;
@@ -1096,7 +1490,7 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 
 	flags = sxdp->sxdp_flags;
 	if (flags & ~(XDP_SHARED_UMEM | XDP_COPY | XDP_ZEROCOPY |
-		      XDP_USE_NEED_WAKEUP | XDP_USE_SG))
+		      XDP_USE_NEED_WAKEUP | XDP_USE_SG | XDP_XDP_EGRESS | XDP_BATCH))
 		return -EINVAL;
 
 	bound_dev_if = READ_ONCE(sk->sk_bound_dev_if);
@@ -1230,7 +1624,60 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	xs->zc = xs->umem->zc;
 	xs->sg = !!(flags & XDP_USE_SG);
 	xs->queue_id = qid;
+
+	if (qid >= MAX_UMEM_QUEUE_SIZE)
+		printk("ERROR: the qid is too big.\n");
+	else
+		xs->umem->is_our_queue[qid] = true;
+
 	xp_add_xsk(xs->pool, xs);
+
+	/* XDP_EGRESS */
+	if (xs->umem->zc && (flags & XDP_XDP_EGRESS)) {
+
+        if (!ns_capable(net->user_ns, CAP_NET_RAW)) {
+            err = -EPERM;
+            goto out_unlock;
+        }
+
+		xs->pool->xdp_egress_prog =
+			bpf_prog_get_type(sxdp->sxdp_xdp_egress_prog_fd, BPF_PROG_TYPE_XDP_EGRESS);
+		if (IS_ERR(xs->pool->xdp_egress_prog)) {
+			printk(KERN_INFO "Request XDP_EGRESS, but no ebpf program was found.\n");
+			xs->pool->xdp_egress_prog = NULL;
+		}
+		else {
+			printk(KERN_INFO "XDP_EGRESS has been loaded.\n");
+		}
+	}
+
+	/* XDP_GEN */
+	if (flags & XDP_BATCH) {
+
+        if (!ns_capable(net->user_ns, CAP_NET_RAW)) {
+            err = -EPERM;
+            goto out_unlock;
+        }
+
+        xs->pool->xdp_gen_prog =
+			bpf_prog_get_type(sxdp->sxdp_xdp_gen_prog_fd, BPF_PROG_TYPE_XDP_GEN);
+		if (IS_ERR(xs->pool->xdp_gen_prog)) {
+			printk(KERN_INFO "Request XDP_GEN, but no ebpf program was found.\n");
+			xs->pool->xdp_gen_prog = NULL;
+		}
+		else {
+			printk(KERN_INFO "XDP_GEN has been loaded.\n");
+		}
+
+	}
+
+	if (xs->pool->xdp_gen_prog) {
+		err = init_xdp_gen(xs);
+		if (err)
+			pr_warn("Failed to init batch xdp for this xsk\n");
+		else
+			printk(KERN_INFO "Batch XDP has been initialized successfully for this xsk.\n");
+	}
 
 out_unlock:
 	if (err) {
@@ -1702,8 +2149,10 @@ static int __init xsk_init(void)
 	if (err)
 		goto out_pernet;
 
-	for_each_possible_cpu(cpu)
+	for_each_possible_cpu(cpu) {
 		INIT_LIST_HEAD(&per_cpu(xskmap_flush_list, cpu));
+		INIT_LIST_HEAD(&per_cpu(lb_flush_list, cpu));
+	}
 	return 0;
 
 out_pernet:

@@ -18,6 +18,12 @@ struct net_device;
 struct xsk_queue;
 struct xdp_buff;
 
+/* XDP_GEN */
+struct xdp_gen_data;
+
+// TODO: We limit the number of queues a UMEM can bind to.
+#define MAX_UMEM_QUEUE_SIZE 64
+
 struct xdp_umem {
 	void *addrs;
 	u64 size;
@@ -33,6 +39,8 @@ struct xdp_umem {
 	int id;
 	struct list_head xsk_dma_list;
 	struct work_struct work;
+
+	bool is_our_queue[MAX_UMEM_QUEUE_SIZE];
 };
 
 struct xsk_map {
@@ -61,6 +69,7 @@ struct xdp_sock {
 
 	struct xsk_queue *tx ____cacheline_aligned_in_smp;
 	struct list_head tx_list;
+    __u32 tx_budget_spent;
 	/* Protects generic receive. */
 	spinlock_t rx_lock;
 
@@ -81,6 +90,9 @@ struct xdp_sock {
 	struct mutex mutex;
 	struct xsk_queue *fq_tmp; /* Only as tmp storage before bind */
 	struct xsk_queue *cq_tmp; /* Only as tmp storage before bind */
+
+	/* XDP_GEN */
+	struct xdp_gen_data *bxd;
 };
 
 #ifdef CONFIG_XDP_SOCKETS
@@ -88,6 +100,8 @@ struct xdp_sock {
 int xsk_generic_rcv(struct xdp_sock *xs, struct xdp_buff *xdp);
 int __xsk_map_redirect(struct xdp_sock *xs, struct xdp_buff *xdp);
 void __xsk_map_flush(void);
+void __xsk_map_flush_raw(void);
+void add_lb_flush(struct xsk_buff_pool *pool);
 
 #else
 
@@ -103,6 +117,15 @@ static inline int __xsk_map_redirect(struct xdp_sock *xs, struct xdp_buff *xdp)
 
 static inline void __xsk_map_flush(void)
 {
+}
+
+static inline void __xsk_map_flush_raw(void)
+{
+}
+
+static inline void add_lb_flush(struct xsk_buff_pool *pool)
+{
+
 }
 
 #endif /* CONFIG_XDP_SOCKETS */

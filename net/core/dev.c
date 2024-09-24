@@ -157,6 +157,21 @@
 #include "dev.h"
 #include "net-sysfs.h"
 
+// bpf_pacer
+#define BPF_PACER
+
+#define BPF_PACER_BUDGET 8
+#define BPF_NETTX_BUDGET 2
+struct task_struct *bpf_pacer_kthread = NULL;
+EXPORT_SYMBOL(bpf_pacer_kthread);
+struct bpf_timer_nettx *bpf_pacer_cb = NULL;
+DEFINE_SPINLOCK(bpf_pacer_lock);
+bool bpf_pacer_continue = false;
+bool bpf_pacer_wakeup = false;
+
+struct completion bpf_pacer_done;
+bool bpf_pacer_exit = false;
+
 static DEFINE_SPINLOCK(ptype_lock);
 struct list_head ptype_base[PTYPE_HASH_SIZE] __read_mostly;
 struct list_head ptype_all __read_mostly;	/* Taps */
@@ -3167,6 +3182,61 @@ void netif_tx_wake_queue(struct netdev_queue *dev_queue)
 }
 EXPORT_SYMBOL(netif_tx_wake_queue);
 
+int netif_tx_schedule_bpf_timer_pacer_wakeup(void)
+{
+	if (!bpf_pacer_kthread)
+		return -EEXIST;
+	WRITE_ONCE(bpf_pacer_wakeup, true);
+	wake_up_process(bpf_pacer_kthread);
+	return 0;
+}
+
+int netif_tx_schedule_bpf_timer_pacer_continue(void)
+{
+	if (!bpf_pacer_kthread)
+		return -EEXIST;
+	bpf_pacer_continue = true;
+	return 0;
+}
+
+int netif_tx_schedule_bpf_timer_pacer(struct bpf_timer_nettx *timer)
+{
+	bool need_bh_off = !(hardirq_count() | softirq_count());
+	WARN_ON_ONCE(need_bh_off);
+	int ret = 0;
+	unsigned long flags;
+
+	if (!timer->next)
+		return -EINVAL;
+
+	if (!bpf_pacer_kthread)
+		return -EEXIST;
+
+	spin_lock_irqsave(&bpf_pacer_lock, flags);
+	if (!bpf_pacer_cb)
+		bpf_pacer_cb = timer;
+	else
+		ret = -E2BIG;
+	spin_unlock_irqrestore(&bpf_pacer_lock, flags);
+
+	return ret;
+}
+
+void netif_tx_schedule_bpf_timer(struct bpf_timer_nettx *timer)
+{
+	bool need_bh_off = !(hardirq_count() | softirq_count());
+
+	WARN_ON_ONCE(need_bh_off);
+
+	if (!timer->next) {
+		struct softnet_data *sd = this_cpu_ptr(&softnet_data);
+
+        sd->bpf_timer = timer;
+
+		raise_softirq_irqoff(NET_TX_SOFTIRQ);
+	}
+}
+
 void dev_kfree_skb_irq_reason(struct sk_buff *skb, enum skb_drop_reason reason)
 {
 	unsigned long flags;
@@ -5143,6 +5213,20 @@ EXPORT_SYMBOL(netif_rx);
 static __latent_entropy void net_tx_action(struct softirq_action *h)
 {
 	struct softnet_data *sd = this_cpu_ptr(&softnet_data);
+    struct bpf_timer_nettx *timer;
+    int work = 0;
+
+	if (sd->bpf_timer) {
+		local_irq_disable();
+        while (sd->bpf_timer) {
+            timer = sd->bpf_timer;
+            sd->bpf_timer = NULL;
+            bpf_run_nettx_timers_one_st(timer);
+            if (++work > BPF_NETTX_BUDGET)
+                break;
+        }
+        local_irq_enable();
+	}
 
 	if (sd->completion_queue) {
 		struct sk_buff *clist;
@@ -11417,6 +11501,65 @@ define_netdev_printk_level(netdev_warn, KERN_WARNING);
 define_netdev_printk_level(netdev_notice, KERN_NOTICE);
 define_netdev_printk_level(netdev_info, KERN_INFO);
 
+void bpf_pacer_stop(void)
+{
+	bpf_pacer_exit = true;
+	wake_up_process(bpf_pacer_kthread);
+	kthread_stop(bpf_pacer_kthread);
+	bpf_pacer_kthread = NULL;
+}
+
+void bpf_pacer_xmit(void)
+{
+	struct bpf_timer_nettx *timer = NULL;
+	unsigned long flags;
+	int work = 0;
+
+	while (bpf_pacer_cb && bpf_pacer_continue) {
+		bpf_pacer_continue = false;
+		spin_lock_irqsave(&bpf_pacer_lock, flags);
+		if (bpf_pacer_cb) {
+			timer = bpf_pacer_cb;
+			bpf_pacer_cb = NULL;
+		}
+		spin_unlock_irqrestore(&bpf_pacer_lock, flags);
+
+		if (timer) {
+			local_bh_disable();
+			bpf_run_nettx_timers_one_st(timer);
+			local_bh_enable();
+			work++;
+		}
+
+		if (work >= BPF_PACER_BUDGET)
+			break;
+	}
+}
+
+int bpf_pacer_main(void *data)
+{
+	while (!bpf_pacer_exit) {
+
+		bpf_pacer_wakeup = false;
+		bpf_pacer_continue = false;
+
+		bpf_pacer_xmit();
+
+		/* eBPF program notifies explicitly that it has work to do */
+		if (bpf_pacer_continue)
+			cond_resched();
+		else if (!READ_ONCE(bpf_pacer_wakeup)) {
+			set_current_state(TASK_INTERRUPTIBLE);
+			/* Recheck to avoid lost wake-up */
+			if (!READ_ONCE(bpf_pacer_wakeup))
+				schedule();
+			else
+				__set_current_state(TASK_RUNNING);
+		}
+	}
+	kthread_complete_and_exit(&bpf_pacer_done, 0);
+}
+
 static void __net_exit netdev_exit(struct net *net)
 {
 	kfree(net->dev_name_head);
@@ -11575,6 +11718,20 @@ static int __init net_dev_init(void)
 
 	open_softirq(NET_TX_SOFTIRQ, net_tx_action);
 	open_softirq(NET_RX_SOFTIRQ, net_rx_action);
+
+    #ifdef BPF_PACER
+	if (!bpf_pacer_kthread) {
+		bpf_pacer_kthread = kthread_run(bpf_pacer_main, NULL, "bpf_pacer");
+		if (IS_ERR(bpf_pacer_kthread)) {
+			int err = PTR_ERR(bpf_pacer_kthread);
+			bpf_pacer_kthread = NULL;
+			printk(KERN_ERR "Failed to start BPF pacer kthread: error %d\n", err);
+		} else {
+			printk(KERN_INFO "Started BPF pacer kthread\n");
+			init_completion(&bpf_pacer_done);
+		}
+	}
+    #endif
 
 	rc = cpuhp_setup_state_nocalls(CPUHP_NET_DEV_DEAD, "net/dev:dead",
 				       NULL, dev_cpu_dead);

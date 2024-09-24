@@ -32,6 +32,12 @@
  */
 #define XDP_USE_SG     (1 << 4)
 
+/* For xdp_egress */
+#define XDP_XDP_EGRESS (1 << 5)
+
+/* For batch xdp */
+#define XDP_BATCH (1 << 6)
+
 /* Flags for xsk_umem_config flags */
 #define XDP_UMEM_UNALIGNED_CHUNK_FLAG (1 << 0)
 
@@ -41,6 +47,8 @@ struct sockaddr_xdp {
 	__u32 sxdp_ifindex;
 	__u32 sxdp_queue_id;
 	__u32 sxdp_shared_umem_fd;
+	__u32 sxdp_xdp_egress_prog_fd;
+	__u32 sxdp_xdp_gen_prog_fd;
 };
 
 /* XDP_RING flags */
@@ -112,8 +120,25 @@ struct xdp_desc {
 	__u32 options;
 };
 
-/* Flag indicating packet constitutes of multiple buffers*/
+/* Flag indicating that the packet continues with the buffer pointed out by the
+ * next frame in the ring. The end of the packet is signalled by setting this
+ * bit to zero. For single buffer packets, every descriptor has 'options' set
+ * to 0 and this maintains backward compatibility.
+ */
 #define XDP_PKT_CONTD (1 << 0)
+
+/*
+ * Only used for case that forwarding packets between two XSKs.
+ * 1) NIC driver uses it to determine if this packet is redirected to another XSK
+ * 2) User space uses it to determine if this packet is received from another XSK
+*/
+#define XDP_EGRESS_FWD (1 << 1)
+
+/* User space uses it to determine if this packet is dropped by XDP_EGRESS */
+#define XDP_EGRESS_SKIP (1 << 2)
+
+/* If this flag is set, there is no completion event for this queued packet */
+#define XDP_EGRESS_NO_COMP (1 << 3)
 
 /* UMEM descriptor is __u64 */
 

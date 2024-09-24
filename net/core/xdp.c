@@ -187,6 +187,7 @@ int __xdp_rxq_info_reg(struct xdp_rxq_info *xdp_rxq,
 	xdp_rxq_info_init(xdp_rxq);
 	xdp_rxq->dev = dev;
 	xdp_rxq->queue_index = queue_index;
+	xdp_rxq->orig_queue_index = U32_MAX;
 	xdp_rxq->napi_id = napi_id;
 	xdp_rxq->frag_size = frag_size;
 
@@ -531,6 +532,20 @@ out:
 }
 EXPORT_SYMBOL_GPL(xdp_return_buff);
 
+void xdp_return_lb_buff(struct xdp_buff *xdp)
+{
+	unsigned long flags;
+	struct xdp_buff_xsk *xskb = container_of(xdp, struct xdp_buff_xsk, xdp);
+	if (!list_empty(&xskb->lb_list_node))
+		return;
+
+	spin_lock_irqsave(&xskb->pool->lb_list_lock, flags);
+	list_add(&xskb->lb_list_node, &xskb->pool->lb_list);
+	xskb->pool->lb_list_cnt++;
+	spin_unlock_irqrestore(&xskb->pool->lb_list_lock, flags);
+}
+EXPORT_SYMBOL_GPL(xdp_return_lb_buff);
+
 void xdp_attachment_setup(struct xdp_attachment_info *info,
 			  struct netdev_bpf *bpf)
 {
@@ -540,6 +555,29 @@ void xdp_attachment_setup(struct xdp_attachment_info *info,
 	info->flags = bpf->flags;
 }
 EXPORT_SYMBOL_GPL(xdp_attachment_setup);
+
+struct xdp_frame *xdp_convert_zc_to_xdp_frame_direct(struct xdp_buff *xdp, bool cpumap)
+{
+	struct xdp_buff_xsk *xskb = container_of(xdp, struct xdp_buff_xsk, xdp);
+	struct xdp_frame *xdpf;
+
+	xdpf = xdp->data_hard_start;
+	if (unlikely(xdp_update_frame_from_buff(xdp, xdpf) < 0))
+		return NULL;
+	/* rxq only valid until napi_schedule ends, convert to xdp_mem_info */
+	xdpf->mem = xdp->rxq->mem;
+
+    xdpf->pool = xskb->pool;
+    if (cpumap)
+        xdpf->xdp = xdp;
+    else {
+        xdpf->desc_addr = xskb->desc_addr;
+        xdpf->tx_ifindex = xdp->txq->dev->ifindex;
+    }
+
+	return xdpf;
+}
+EXPORT_SYMBOL_GPL(xdp_convert_zc_to_xdp_frame_direct);
 
 struct xdp_frame *xdp_convert_zc_to_xdp_frame(struct xdp_buff *xdp)
 {
@@ -574,8 +612,15 @@ struct xdp_frame *xdp_convert_zc_to_xdp_frame(struct xdp_buff *xdp)
 	xdpf->metasize = metasize;
 	xdpf->frame_sz = PAGE_SIZE;
 	xdpf->mem.type = MEM_TYPE_PAGE_ORDER0;
+	xdpf->flags = xdp->flags;
 
-	xsk_buff_free(xdp);
+	xdpf->xdp = NULL;
+
+	if (xdp->txq != NULL)
+		xdpf->tx_ifindex = xdp->txq->dev->ifindex;
+
+	if (!(xdp->flags & XDP_FLAGS_XSK_QUEUEING))
+		xsk_buff_free(xdp);
 	return xdpf;
 }
 EXPORT_SYMBOL_GPL(xdp_convert_zc_to_xdp_frame);
@@ -772,6 +817,76 @@ static int __init xdp_metadata_init(void)
 	return register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &xdp_metadata_kfunc_set);
 }
 late_initcall(xdp_metadata_init);
+
+__diag_push();
+__diag_ignore_all("-Wmissing-prototypes",
+		  "Global functions as their definitions will be in vmlinux BTF");
+__bpf_kfunc struct xdp_frame *pkt_queue_dequeue(struct bpf_map *map, u64 flags, u64 *rank)
+{
+	return pkt_queue_map_dequeue(map, flags, rank);
+}
+
+__bpf_kfunc bool pkt_queue_empty(struct bpf_map *map, u64 flags, u64 *rank)
+{
+	return pkt_queue_map_empty(map, flags, rank);
+}
+
+__bpf_kfunc int pkt_queue_enqueue(struct bpf_map *map, struct xdp_frame *xdpf, u64 index)
+{
+	return pkt_queue_map_enqueue_front(map, xdpf, index);
+}
+
+__bpf_kfunc int bpf_packet_drop(struct xdp_frame *pkt)
+{
+	if (!pkt) return -EINVAL;
+
+	return 0;
+}
+
+__bpf_kfunc int bpf_packet_send(struct xdp_frame *pkt, int ifindex, u64 flags)
+{
+	struct net_device *dev;
+
+	if (flags)
+		return -EINVAL;
+
+	/* FIXME: need real netns selection here */
+	dev = dev_get_by_index_rcu(&init_net, ifindex);
+	if (unlikely(!dev))
+		return -EINVAL;
+
+	return dev_xdp_enqueue(dev, pkt, dev);
+}
+
+__bpf_kfunc int bpf_packet_flush(void)
+{
+	__dev_flush();
+	return 0;
+}
+__diag_pop();
+
+BTF_SET8_START(pkt_queue_kfunc_ids)
+BTF_ID_FLAGS(func, pkt_queue_dequeue)
+BTF_ID_FLAGS(func, pkt_queue_enqueue)
+BTF_ID_FLAGS(func, pkt_queue_empty)
+BTF_ID_FLAGS(func, bpf_packet_drop)
+BTF_ID_FLAGS(func, bpf_packet_send)
+BTF_ID_FLAGS(func, bpf_packet_flush)
+BTF_SET8_END(pkt_queue_kfunc_ids)
+
+static const struct btf_kfunc_id_set pkt_queue_kfunc_set = {
+	.owner = THIS_MODULE,
+	.set   = &pkt_queue_kfunc_ids,
+};
+
+static int __init pkt_queue_init(void)
+{
+	int ret;
+
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &pkt_queue_kfunc_set);
+	return ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP_EGRESS, &pkt_queue_kfunc_set);
+}
+late_initcall(pkt_queue_init);
 
 void xdp_set_features_flag(struct net_device *dev, xdp_features_t val)
 {

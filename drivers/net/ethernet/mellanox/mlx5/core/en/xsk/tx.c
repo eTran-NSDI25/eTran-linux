@@ -65,7 +65,7 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
 	bool work_done = true;
 	bool flush = false;
 
-	xdpi.mode = MLX5E_XDP_XMIT_MODE_XSK;
+	xdpi.mode = pool->xdp_egress_prog ? MLX5E_XDP_XMIT_MODE_XSK_OOO_COMP : MLX5E_XDP_XMIT_MODE_XSK;
 
 	for (; budget; budget--) {
 		int check_result = INDIRECT_CALL_2(sq->xmit_xdp_frame_check,
@@ -90,6 +90,11 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
 			break;
 		}
 
+        if (xsk_tx_skip_desc(&desc)) {
+            flush = true;
+            continue;
+        }
+
 		xdptxd.dma_addr = xsk_buff_raw_get_dma(pool, desc.addr);
 		xdptxd.data = xsk_buff_raw_get_data(pool, desc.addr);
 		xdptxd.len = desc.len;
@@ -106,6 +111,9 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
 			mlx5e_xsk_tx_post_err(sq, &xdpi);
 		} else {
 			mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo, xdpi);
+            if (xdpi.mode == MLX5E_XDP_XMIT_MODE_XSK_OOO_COMP) {
+                mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo, (union mlx5e_xdp_info) { .frame.desc_addr = desc.addr });
+            }
 		}
 
 		flush = true;

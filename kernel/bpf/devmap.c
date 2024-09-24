@@ -82,6 +82,10 @@ struct bpf_dtab {
 	unsigned int items;
 	u32 n_buckets;
 };
+// bpf pacer
+extern struct task_struct *bpf_pacer_kthread;
+DEFINE_PER_CPU(bool, bpf_pacer_need_wakeup);
+EXPORT_PER_CPU_SYMBOL(bpf_pacer_need_wakeup);
 
 static DEFINE_PER_CPU(struct list_head, dev_flush_list);
 static DEFINE_SPINLOCK(dev_map_lock);
@@ -393,12 +397,28 @@ static void bq_xmit_all(struct xdp_dev_bulk_queue *bq, u32 flags)
 	/* If not all frames have been transmitted, it is our
 	 * responsibility to free them
 	 */
-	for (i = sent; unlikely(i < to_send); i++)
-		xdp_return_frame_rx_napi(bq->q[i]);
+	for (i = sent; unlikely(i < to_send); i++) {
+		// printk(KERN_INFO "ndo_xdp_xmit failed, %d", i);
+		if (!(bq->q[i]->flags & XDP_FLAGS_XSK_QUEUEING))
+			xdp_return_frame_rx_napi(bq->q[i]);
+	}
 
 out:
 	bq->count = 0;
 	trace_xdp_devmap_xmit(bq->dev_rx, dev, sent, cnt - sent, err);
+}
+
+void __bpf_pacer_flush(void)
+{
+	bool *need_wakeup = this_cpu_ptr(&bpf_pacer_need_wakeup);
+
+	if (!bpf_pacer_kthread)
+		return;
+
+	if (*need_wakeup) {
+		wake_up_process(bpf_pacer_kthread);
+		*need_wakeup = false;
+	}
 }
 
 /* __dev_flush is called from xdp_do_flush() which _must_ be signalled from the

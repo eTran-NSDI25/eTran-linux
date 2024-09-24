@@ -10,6 +10,10 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_SCHED_ACT, tc_cls_act,
 	      struct __sk_buff, struct sk_buff)
 BPF_PROG_TYPE(BPF_PROG_TYPE_XDP, xdp,
 	      struct xdp_md, struct xdp_buff)
+BPF_PROG_TYPE(BPF_PROG_TYPE_XDP_EGRESS, xdp_egress,
+	      struct xdp_md, struct xdp_buff)
+BPF_PROG_TYPE(BPF_PROG_TYPE_XDP_GEN, xdp_gen,
+	      struct xdp_md, struct xdp_buff)
 #ifdef CONFIG_CGROUP_BPF
 BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SKB, cg_skb,
 	      struct __sk_buff, struct sk_buff)
@@ -117,6 +121,7 @@ BPF_MAP_TYPE(BPF_MAP_TYPE_SK_STORAGE, sk_storage_map_ops)
 BPF_MAP_TYPE(BPF_MAP_TYPE_CPUMAP, cpu_map_ops)
 #if defined(CONFIG_XDP_SOCKETS)
 BPF_MAP_TYPE(BPF_MAP_TYPE_XSKMAP, xsk_map_ops)
+BPF_MAP_TYPE(BPF_MAP_TYPE_PKT_QUEUE, pkt_queue_ops)
 #endif
 #ifdef CONFIG_INET
 BPF_MAP_TYPE(BPF_MAP_TYPE_SOCKMAP, sock_map_ops)

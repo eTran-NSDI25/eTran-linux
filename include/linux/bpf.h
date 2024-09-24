@@ -664,12 +664,15 @@ enum bpf_type_flag {
 	/* DYNPTR points to xdp_buff */
 	DYNPTR_TYPE_XDP		= BIT(16 + BPF_BASE_TYPE_BITS),
 
+	/* DYNPTR points to xdp_frame */
+	DYNPTR_TYPE_XDP_FRAME		= BIT(17 + BPF_BASE_TYPE_BITS),
+
 	__BPF_TYPE_FLAG_MAX,
 	__BPF_TYPE_LAST_FLAG	= __BPF_TYPE_FLAG_MAX - 1,
 };
 
 #define DYNPTR_TYPE_FLAG_MASK	(DYNPTR_TYPE_LOCAL | DYNPTR_TYPE_RINGBUF | DYNPTR_TYPE_SKB \
-				 | DYNPTR_TYPE_XDP)
+				 | DYNPTR_TYPE_XDP | DYNPTR_TYPE_XDP_FRAME)
 
 /* Max number of base types. */
 #define BPF_BASE_TYPE_LIMIT	(1UL << BPF_BASE_TYPE_BITS)
@@ -1207,6 +1210,8 @@ enum bpf_dynptr_type {
 	BPF_DYNPTR_TYPE_SKB,
 	/* Underlying data is a xdp_buff */
 	BPF_DYNPTR_TYPE_XDP,
+	/* Underlying data is an xdp_frame */
+	BPF_DYNPTR_TYPE_XDP_FRAME,
 };
 
 int bpf_dynptr_check_size(u32 size);
@@ -1771,6 +1776,10 @@ struct bpf_event_entry {
 	struct rcu_head rcu;
 };
 
+struct bpf_timer_nettx {
+	struct bpf_timer_nettx *next;
+};
+
 static inline bool map_type_contains_progs(struct bpf_map *map)
 {
 	return map->map_type == BPF_MAP_TYPE_PROG_ARRAY ||
@@ -2312,6 +2321,7 @@ struct sk_buff;
 struct bpf_dtab_netdev;
 struct bpf_cpu_map_entry;
 
+void __bpf_pacer_flush(void);
 void __dev_flush(void);
 int dev_xdp_enqueue(struct net_device *dev, struct xdp_frame *xdpf,
 		    struct net_device *dev_rx);
@@ -2330,6 +2340,11 @@ int cpu_map_enqueue(struct bpf_cpu_map_entry *rcpu, struct xdp_frame *xdpf,
 		    struct net_device *dev_rx);
 int cpu_map_generic_redirect(struct bpf_cpu_map_entry *rcpu,
 			     struct sk_buff *skb);
+
+int pkt_queue_map_enqueue(struct bpf_map *map, struct xdp_frame *xdpf, u64 index);
+int pkt_queue_map_enqueue_front(struct bpf_map *map, struct xdp_frame *xdpf, u64 index);
+struct xdp_frame *pkt_queue_map_dequeue(struct bpf_map *map, u64 flags, u64 *rank);
+bool pkt_queue_map_empty(struct bpf_map *map, u64 flags, u64 *rank);
 
 /* Return map's numa specified by userspace */
 static inline int bpf_map_attr_numa_node(const union bpf_attr *attr)
@@ -2461,6 +2476,10 @@ void bpf_dynptr_init(struct bpf_dynptr_kern *ptr, void *data,
 		     enum bpf_dynptr_type type, u32 offset, u32 size);
 void bpf_dynptr_set_null(struct bpf_dynptr_kern *ptr);
 void bpf_dynptr_set_rdonly(struct bpf_dynptr_kern *ptr);
+
+struct bpf_timer_nettx * bpf_run_nettx_timers(struct bpf_timer_nettx *timer, int budget);
+void bpf_run_nettx_timers_one_st(struct bpf_timer_nettx *timer);
+
 #else /* !CONFIG_BPF_SYSCALL */
 static inline struct bpf_prog *bpf_prog_get(u32 ufd)
 {
@@ -2593,6 +2612,27 @@ static inline int cpu_map_generic_redirect(struct bpf_cpu_map_entry *rcpu,
 	return -EOPNOTSUPP;
 }
 
+static inline int pkt_queue_map_enqueue(struct bpf_map *map, struct xdp_frame *xdp, u32 index)
+{
+	return 0;
+}
+
+static inline int pkt_queue_map_enqueue_front(struct bpf_map *map, struct xdp_frame *xdp, u32 index)
+{
+	return 0;
+}
+
+static inline struct xdp_frame *pkt_queue_map_dequeue(struct bpf_map *map, u64 flags, u64 *rank)
+{
+	return NULL;
+}
+
+static inline bool pkt_queue_map_empty(struct bpf_map *map, u64 flags, u64 *rank)
+{
+    return true;
+}
+
+
 static inline struct bpf_prog *bpf_prog_get_type_path(const char *name,
 				enum bpf_prog_type type)
 {
@@ -2711,6 +2751,16 @@ static inline void bpf_dynptr_set_null(struct bpf_dynptr_kern *ptr)
 static inline void bpf_dynptr_set_rdonly(struct bpf_dynptr_kern *ptr)
 {
 }
+
+static inline struct bpf_timer_nettx *bpf_run_nettx_timers(struct bpf_timer_nettx *timer, int budget)
+{
+
+}
+
+static inline void bpf_run_nettx_timers_one_st(struct bpf_timer_nettx *timer)
+{
+}
+
 #endif /* CONFIG_BPF_SYSCALL */
 
 static __always_inline int

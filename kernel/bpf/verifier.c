@@ -745,6 +745,8 @@ static const char *dynptr_type_str(enum bpf_dynptr_type type)
 		return "skb";
 	case BPF_DYNPTR_TYPE_XDP:
 		return "xdp";
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
+		return "xdp_frame";
 	case BPF_DYNPTR_TYPE_INVALID:
 		return "<invalid>";
 	default:
@@ -826,6 +828,8 @@ static enum bpf_dynptr_type arg_to_dynptr_type(enum bpf_arg_type arg_type)
 		return BPF_DYNPTR_TYPE_SKB;
 	case DYNPTR_TYPE_XDP:
 		return BPF_DYNPTR_TYPE_XDP;
+	case DYNPTR_TYPE_XDP_FRAME:
+		return BPF_DYNPTR_TYPE_XDP_FRAME;
 	default:
 		return BPF_DYNPTR_TYPE_INVALID;
 	}
@@ -842,6 +846,8 @@ static enum bpf_type_flag get_dynptr_type_flag(enum bpf_dynptr_type type)
 		return DYNPTR_TYPE_SKB;
 	case BPF_DYNPTR_TYPE_XDP:
 		return DYNPTR_TYPE_XDP;
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
+		return DYNPTR_TYPE_XDP_FRAME;
 	default:
 		return 0;
 	}
@@ -2006,7 +2012,8 @@ static bool reg_is_pkt_pointer_any(const struct bpf_reg_state *reg)
 static bool reg_is_dynptr_slice_pkt(const struct bpf_reg_state *reg)
 {
 	return base_type(reg->type) == PTR_TO_MEM &&
-		(reg->type & DYNPTR_TYPE_SKB || reg->type & DYNPTR_TYPE_XDP);
+			(reg->type & DYNPTR_TYPE_SKB || reg->type & DYNPTR_TYPE_XDP ||
+			reg->type & DYNPTR_TYPE_XDP_FRAME);
 }
 
 /* Unmodified PTR_TO_PACKET[_META,_END] register from ctx access. */
@@ -5232,6 +5239,8 @@ static bool may_access_direct_pkt_data(struct bpf_verifier_env *env,
 	case BPF_PROG_TYPE_SCHED_CLS:
 	case BPF_PROG_TYPE_SCHED_ACT:
 	case BPF_PROG_TYPE_XDP:
+	case BPF_PROG_TYPE_XDP_EGRESS:
+	case BPF_PROG_TYPE_XDP_GEN:
 	case BPF_PROG_TYPE_LWT_XMIT:
 	case BPF_PROG_TYPE_SK_SKB:
 	case BPF_PROG_TYPE_SK_MSG:
@@ -8515,7 +8524,7 @@ static int check_map_func_compatibility(struct bpf_verifier_env *env,
 		break;
 	case BPF_MAP_TYPE_QUEUE:
 	case BPF_MAP_TYPE_STACK:
-		if (func_id != BPF_FUNC_map_peek_elem &&
+        if (func_id != BPF_FUNC_map_peek_elem &&
 		    func_id != BPF_FUNC_map_pop_elem &&
 		    func_id != BPF_FUNC_map_push_elem)
 			goto error;
@@ -8597,6 +8606,7 @@ static int check_map_func_compatibility(struct bpf_verifier_env *env,
 		if (map->map_type != BPF_MAP_TYPE_DEVMAP &&
 		    map->map_type != BPF_MAP_TYPE_DEVMAP_HASH &&
 		    map->map_type != BPF_MAP_TYPE_CPUMAP &&
+			map->map_type != BPF_MAP_TYPE_PKT_QUEUE &&
 		    map->map_type != BPF_MAP_TYPE_XSKMAP)
 			goto error;
 		break;
@@ -10259,10 +10269,15 @@ enum special_kfunc_type {
 	KF_bpf_rcu_read_lock,
 	KF_bpf_rcu_read_unlock,
 	KF_bpf_rbtree_remove,
+	KF_bpf_rbtree_lower_bound_impl,
+	KF_bpf_rbtree_search_impl,
+	KF_bpf_rbtree_search_less_impl,
 	KF_bpf_rbtree_add_impl,
 	KF_bpf_rbtree_first,
+	KF_bpf_rbtree_next,
 	KF_bpf_dynptr_from_skb,
 	KF_bpf_dynptr_from_xdp,
+	KF_bpf_dynptr_from_xdp_frame,
 	KF_bpf_dynptr_slice,
 	KF_bpf_dynptr_slice_rdwr,
 	KF_bpf_dynptr_clone,
@@ -10279,10 +10294,15 @@ BTF_ID(func, bpf_list_pop_back)
 BTF_ID(func, bpf_cast_to_kern_ctx)
 BTF_ID(func, bpf_rdonly_cast)
 BTF_ID(func, bpf_rbtree_remove)
+BTF_ID(func, bpf_rbtree_lower_bound_impl)
+BTF_ID(func, bpf_rbtree_search_impl)
+BTF_ID(func, bpf_rbtree_search_less_impl)
 BTF_ID(func, bpf_rbtree_add_impl)
 BTF_ID(func, bpf_rbtree_first)
+BTF_ID(func, bpf_rbtree_next)
 BTF_ID(func, bpf_dynptr_from_skb)
 BTF_ID(func, bpf_dynptr_from_xdp)
+BTF_ID(func, bpf_dynptr_from_xdp_frame)
 BTF_ID(func, bpf_dynptr_slice)
 BTF_ID(func, bpf_dynptr_slice_rdwr)
 BTF_ID(func, bpf_dynptr_clone)
@@ -10301,10 +10321,15 @@ BTF_ID(func, bpf_rdonly_cast)
 BTF_ID(func, bpf_rcu_read_lock)
 BTF_ID(func, bpf_rcu_read_unlock)
 BTF_ID(func, bpf_rbtree_remove)
+BTF_ID(func, bpf_rbtree_lower_bound_impl)
+BTF_ID(func, bpf_rbtree_search_impl)
+BTF_ID(func, bpf_rbtree_search_less_impl)
 BTF_ID(func, bpf_rbtree_add_impl)
 BTF_ID(func, bpf_rbtree_first)
+BTF_ID(func, bpf_rbtree_next)
 BTF_ID(func, bpf_dynptr_from_skb)
 BTF_ID(func, bpf_dynptr_from_xdp)
+BTF_ID(func, bpf_dynptr_from_xdp_frame)
 BTF_ID(func, bpf_dynptr_slice)
 BTF_ID(func, bpf_dynptr_slice_rdwr)
 BTF_ID(func, bpf_dynptr_clone)
@@ -10611,7 +10636,11 @@ static bool is_bpf_rbtree_api_kfunc(u32 btf_id)
 {
 	return btf_id == special_kfunc_list[KF_bpf_rbtree_add_impl] ||
 	       btf_id == special_kfunc_list[KF_bpf_rbtree_remove] ||
-	       btf_id == special_kfunc_list[KF_bpf_rbtree_first];
+		   btf_id == special_kfunc_list[KF_bpf_rbtree_lower_bound_impl] ||
+	       btf_id == special_kfunc_list[KF_bpf_rbtree_search_impl] ||
+	       btf_id == special_kfunc_list[KF_bpf_rbtree_search_less_impl] ||
+	       btf_id == special_kfunc_list[KF_bpf_rbtree_first] ||
+	       btf_id == special_kfunc_list[KF_bpf_rbtree_next];
 }
 
 static bool is_bpf_graph_api_kfunc(u32 btf_id)
@@ -10622,7 +10651,10 @@ static bool is_bpf_graph_api_kfunc(u32 btf_id)
 
 static bool is_callback_calling_kfunc(u32 btf_id)
 {
-	return btf_id == special_kfunc_list[KF_bpf_rbtree_add_impl];
+	return btf_id == special_kfunc_list[KF_bpf_rbtree_add_impl] ||
+		   btf_id == special_kfunc_list[KF_bpf_rbtree_lower_bound_impl] ||
+	       btf_id == special_kfunc_list[KF_bpf_rbtree_search_impl] ||
+	       btf_id == special_kfunc_list[KF_bpf_rbtree_search_less_impl];
 }
 
 static bool is_rbtree_lock_required_kfunc(u32 btf_id)
@@ -10668,6 +10700,10 @@ static bool check_kfunc_is_graph_node_api(struct bpf_verifier_env *env,
 		break;
 	case BPF_RB_NODE:
 		ret = (kfunc_btf_id == special_kfunc_list[KF_bpf_rbtree_remove] ||
+		       kfunc_btf_id == special_kfunc_list[KF_bpf_rbtree_next] ||
+			   kfunc_btf_id == special_kfunc_list[KF_bpf_rbtree_lower_bound_impl] ||
+		       kfunc_btf_id == special_kfunc_list[KF_bpf_rbtree_search_impl] ||
+		       kfunc_btf_id == special_kfunc_list[KF_bpf_rbtree_search_less_impl] ||
 		       kfunc_btf_id == special_kfunc_list[KF_bpf_rbtree_add_impl]);
 		break;
 	default:
@@ -11053,6 +11089,8 @@ static int check_kfunc_args(struct bpf_verifier_env *env, struct bpf_kfunc_call_
 					return -EFAULT;
 				}
 			}
+			else if (meta->func_id == special_kfunc_list[KF_bpf_dynptr_from_xdp_frame])
+				dynptr_arg_type |= DYNPTR_TYPE_XDP_FRAME;
 
 			ret = process_dynptr_func(env, regno, insn_idx, dynptr_arg_type, clone_ref_obj_id);
 			if (ret < 0)
@@ -11126,6 +11164,15 @@ static int check_kfunc_args(struct bpf_verifier_env *env, struct bpf_kfunc_call_
 				}
 				if (in_rbtree_lock_required_cb(env)) {
 					verbose(env, "rbtree_remove not allowed in rbtree cb\n");
+					return -EINVAL;
+				}
+			} else if (meta->func_id == special_kfunc_list[KF_bpf_rbtree_next]) {
+				if (!type_is_non_owning_ref(reg->type) || reg->ref_obj_id) {
+					verbose(env, "rbtree_next node input must be non-owning ref\n");
+					return -EINVAL;
+				}
+				if (in_rbtree_lock_required_cb(env)) {
+					verbose(env, "rbtree_next not allowed in rbtree cb\n");
 					return -EINVAL;
 				}
 			} else {
@@ -11372,7 +11419,10 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 
 	if (meta.func_id == special_kfunc_list[KF_bpf_list_push_front_impl] ||
 	    meta.func_id == special_kfunc_list[KF_bpf_list_push_back_impl] ||
-	    meta.func_id == special_kfunc_list[KF_bpf_rbtree_add_impl]) {
+	    meta.func_id == special_kfunc_list[KF_bpf_rbtree_add_impl] ||
+		meta.func_id == special_kfunc_list[KF_bpf_rbtree_lower_bound_impl] ||
+	    meta.func_id == special_kfunc_list[KF_bpf_rbtree_search_less_impl] ||
+	    meta.func_id == special_kfunc_list[KF_bpf_rbtree_search_impl]) {
 		release_ref_obj_id = regs[BPF_REG_2].ref_obj_id;
 		insn_aux->insert_off = regs[BPF_REG_2].off;
 		insn_aux->kptr_struct_meta = btf_find_struct_meta(meta.arg_btf, meta.arg_btf_id);
@@ -11391,7 +11441,10 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		}
 	}
 
-	if (meta.func_id == special_kfunc_list[KF_bpf_rbtree_add_impl]) {
+	if (meta.func_id == special_kfunc_list[KF_bpf_rbtree_add_impl] ||
+		meta.func_id == special_kfunc_list[KF_bpf_rbtree_lower_bound_impl] ||
+		meta.func_id == special_kfunc_list[KF_bpf_rbtree_search_impl] ||
+		meta.func_id == special_kfunc_list[KF_bpf_rbtree_search_less_impl]) {
 		err = __check_func_call(env, insn, insn_idx_p, meta.subprogno,
 					set_rbtree_add_callback_state);
 		if (err) {
@@ -11474,7 +11527,11 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 
 				mark_reg_graph_node(regs, BPF_REG_0, &field->graph_root);
 			} else if (meta.func_id == special_kfunc_list[KF_bpf_rbtree_remove] ||
-				   meta.func_id == special_kfunc_list[KF_bpf_rbtree_first]) {
+				   meta.func_id == special_kfunc_list[KF_bpf_rbtree_lower_bound_impl] ||
+				   meta.func_id == special_kfunc_list[KF_bpf_rbtree_search_impl] ||
+				   meta.func_id == special_kfunc_list[KF_bpf_rbtree_search_less_impl] ||
+				   meta.func_id == special_kfunc_list[KF_bpf_rbtree_first] ||
+				   meta.func_id == special_kfunc_list[KF_bpf_rbtree_next]) {
 				struct btf_field *field = meta.arg_rbtree_root.field;
 
 				mark_reg_graph_node(regs, BPF_REG_0, &field->graph_root);
@@ -11587,7 +11644,11 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			if (is_kfunc_ret_null(&meta))
 				regs[BPF_REG_0].id = id;
 			regs[BPF_REG_0].ref_obj_id = id;
-		} else if (meta.func_id == special_kfunc_list[KF_bpf_rbtree_first]) {
+		} else if (meta.func_id == special_kfunc_list[KF_bpf_rbtree_next] ||
+			meta.func_id == special_kfunc_list[KF_bpf_rbtree_first] ||
+			meta.func_id == special_kfunc_list[KF_bpf_rbtree_lower_bound_impl] ||
+			meta.func_id == special_kfunc_list[KF_bpf_rbtree_search_impl] ||
+			meta.func_id == special_kfunc_list[KF_bpf_rbtree_search_less_impl]) {
 			ref_set_non_owning(env, &regs[BPF_REG_0]);
 		}
 
@@ -18292,13 +18353,19 @@ static int fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		*cnt = 3;
 	} else if (desc->func_id == special_kfunc_list[KF_bpf_list_push_back_impl] ||
 		   desc->func_id == special_kfunc_list[KF_bpf_list_push_front_impl] ||
-		   desc->func_id == special_kfunc_list[KF_bpf_rbtree_add_impl]) {
+		   desc->func_id == special_kfunc_list[KF_bpf_rbtree_add_impl] ||
+		   desc->func_id == special_kfunc_list[KF_bpf_rbtree_lower_bound_impl] ||
+		   desc->func_id == special_kfunc_list[KF_bpf_rbtree_search_impl] ||
+		   desc->func_id == special_kfunc_list[KF_bpf_rbtree_search_less_impl]) {
 		struct btf_struct_meta *kptr_struct_meta = env->insn_aux_data[insn_idx].kptr_struct_meta;
 		int struct_meta_reg = BPF_REG_3;
 		int node_offset_reg = BPF_REG_4;
 
 		/* rbtree_add has extra 'less' arg, so args-to-fixup are in diff regs */
-		if (desc->func_id == special_kfunc_list[KF_bpf_rbtree_add_impl]) {
+		if (desc->func_id == special_kfunc_list[KF_bpf_rbtree_add_impl] ||
+			desc->func_id == special_kfunc_list[KF_bpf_rbtree_lower_bound_impl] ||
+			desc->func_id == special_kfunc_list[KF_bpf_rbtree_search_impl] ||
+			desc->func_id == special_kfunc_list[KF_bpf_rbtree_search_less_impl]) {
 			struct_meta_reg = BPF_REG_4;
 			node_offset_reg = BPF_REG_5;
 		}

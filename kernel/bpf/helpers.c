@@ -1092,11 +1092,13 @@ const struct bpf_func_proto bpf_snprintf_proto = {
  * freeing the timers when inner map is replaced or deleted by user space.
  */
 struct bpf_hrtimer {
+	struct bpf_timer_nettx net_timer;
 	struct hrtimer timer;
 	struct bpf_map *map;
 	struct bpf_prog *prog;
 	void __rcu *callback_fn;
 	void *value;
+	bool is_net_timer;
 };
 
 /* the actual struct hidden inside uapi struct bpf_timer */
@@ -1150,21 +1152,54 @@ out:
 	return HRTIMER_NORESTART;
 }
 
+static enum hrtimer_restart bpf_timer_cb_nettx(struct hrtimer *hrtimer)
+{
+	struct bpf_hrtimer *t = container_of(hrtimer, struct bpf_hrtimer, timer);
+
+	/* Enqueue the timer and schedule NET_TX_SOFTIRQ */
+	netif_tx_schedule_bpf_timer(&t->net_timer);
+	return HRTIMER_NORESTART;
+}
+
+struct bpf_timer_nettx * bpf_run_nettx_timers(struct bpf_timer_nettx *timer, int budget)
+{
+	while (timer && budget-- > 0) {
+		struct bpf_hrtimer *hrt = container_of(timer, struct bpf_hrtimer, net_timer);
+		struct bpf_timer_nettx *next = timer->next;
+
+		timer->next = NULL;
+		bpf_timer_cb(&hrt->timer);
+		timer = next;
+	}
+
+    return timer;
+}
+
+void bpf_run_nettx_timers_one_st(struct bpf_timer_nettx *timer)
+{
+	if (timer) {
+		struct bpf_hrtimer *hrt = container_of(timer, struct bpf_hrtimer, net_timer);
+		bpf_timer_cb(&hrt->timer);
+	}
+}
+
 BPF_CALL_3(bpf_timer_init, struct bpf_timer_kern *, timer, struct bpf_map *, map,
 	   u64, flags)
 {
 	clockid_t clockid = flags & (MAX_CLOCKS - 1);
+	// FIXME: Should only be allowed from XDP or XDP_EGRESS programs
+	bool net_timer = flags & BPF_F_TIMER_NET_TX;
 	struct bpf_hrtimer *t;
 	int ret = 0;
 
-	BUILD_BUG_ON(MAX_CLOCKS != 16);
+	BUILD_BUG_ON(MAX_CLOCKS != BPF_F_TIMER_NET_TX);
 	BUILD_BUG_ON(sizeof(struct bpf_timer_kern) > sizeof(struct bpf_timer));
 	BUILD_BUG_ON(__alignof__(struct bpf_timer_kern) != __alignof__(struct bpf_timer));
 
 	if (in_nmi())
 		return -EOPNOTSUPP;
 
-	if (flags >= MAX_CLOCKS ||
+	if (flags & ~(BPF_F_TIMER_NET_TX | CLOCK_MONOTONIC | CLOCK_REALTIME | CLOCK_BOOTTIME) ||
 	    /* similar to timerfd except _ALARM variants are not supported */
 	    (clockid != CLOCK_MONOTONIC &&
 	     clockid != CLOCK_REALTIME &&
@@ -1192,9 +1227,10 @@ BPF_CALL_3(bpf_timer_init, struct bpf_timer_kern *, timer, struct bpf_map *, map
 	t->value = (void *)timer - map->record->timer_off;
 	t->map = map;
 	t->prog = NULL;
+	t->is_net_timer = net_timer;
 	rcu_assign_pointer(t->callback_fn, NULL);
 	hrtimer_init(&t->timer, clockid, HRTIMER_MODE_REL_SOFT);
-	t->timer.function = bpf_timer_cb;
+	t->timer.function = net_timer ? bpf_timer_cb_nettx : bpf_timer_cb;
 	timer->timer = t;
 out:
 	__bpf_spin_unlock_irqrestore(&timer->lock);
@@ -1271,12 +1307,37 @@ BPF_CALL_3(bpf_timer_start, struct bpf_timer_kern *, timer, u64, nsecs, u64, fla
 
 	if (in_nmi())
 		return -EOPNOTSUPP;
-	if (flags > BPF_F_TIMER_ABS)
+	if (flags & ~(BPF_F_TIMER_ABS | BPF_F_TIMER_IMMEDIATE | BPF_F_TIMER_PACER | BPF_F_TIMER_PACER_WAKEUP | BPF_F_TIMER_PACER_CONTINUE))
 		return -EINVAL;
 	__bpf_spin_lock_irqsave(&timer->lock);
 	t = timer->timer;
-	if (!t || !t->prog) {
+	if (!t || !t->prog ||
+	    (((flags & BPF_F_TIMER_IMMEDIATE) || (flags & BPF_F_TIMER_PACER)
+			|| (flags & BPF_F_TIMER_PACER_WAKEUP) || (flags & BPF_F_TIMER_PACER_CONTINUE)) && !t->is_net_timer)) {
 		ret = -EINVAL;
+		goto out;
+	}
+
+	if (flags & BPF_F_TIMER_PACER_CONTINUE) {
+		ret = netif_tx_schedule_bpf_timer_pacer_continue();
+		if (ret)
+			goto out;
+	}
+
+	if (flags & BPF_F_TIMER_PACER_WAKEUP) {
+		ret = netif_tx_schedule_bpf_timer_pacer_wakeup();
+		if (ret)
+			goto out;
+	}
+
+	if (flags & BPF_F_TIMER_PACER) {
+		ret = netif_tx_schedule_bpf_timer_pacer(&t->net_timer);
+		goto out;
+	}
+
+	if (flags & BPF_F_TIMER_IMMEDIATE) {
+		/* Enqueue the timer and schedule NET_TX_SOFTIRQ immediately */
+		netif_tx_schedule_bpf_timer(&t->net_timer);
 		goto out;
 	}
 
@@ -1549,6 +1610,8 @@ BPF_CALL_5(bpf_dynptr_read, void *, dst, u32, len, const struct bpf_dynptr_kern 
 		return __bpf_skb_load_bytes(src->data, src->offset + offset, dst, len);
 	case BPF_DYNPTR_TYPE_XDP:
 		return __bpf_xdp_load_bytes(src->data, src->offset + offset, dst, len);
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
+		return __bpf_xdp_frame_load_bytes(src->data, src->offset + offset, dst, len);
 	default:
 		WARN_ONCE(true, "bpf_dynptr_read: unknown dynptr type %d\n", type);
 		return -EFAULT;
@@ -1599,6 +1662,10 @@ BPF_CALL_5(bpf_dynptr_write, const struct bpf_dynptr_kern *, dst, u32, offset, v
 		if (flags)
 			return -EINVAL;
 		return __bpf_xdp_store_bytes(dst->data, dst->offset + offset, src, len);
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
+		if (flags)
+			return -EINVAL;
+		return __bpf_xdp_frame_store_bytes(dst->data, dst->offset + offset, src, len);
 	default:
 		WARN_ONCE(true, "bpf_dynptr_write: unknown dynptr type %d\n", type);
 		return -EFAULT;
@@ -1639,6 +1706,7 @@ BPF_CALL_3(bpf_dynptr_data, const struct bpf_dynptr_kern *, ptr, u32, offset, u3
 		return (unsigned long)(ptr->data + ptr->offset + offset);
 	case BPF_DYNPTR_TYPE_SKB:
 	case BPF_DYNPTR_TYPE_XDP:
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
 		/* skb and xdp dynptrs should use bpf_dynptr_slice / bpf_dynptr_slice_rdwr */
 		return 0;
 	default:
@@ -1857,6 +1925,12 @@ unlock:
 	for (pos = rb_first_postorder(root); \
 	    pos && ({ n = rb_next_postorder(pos); 1; }); \
 	    pos = n)
+
+// root's type is struct rb_root_cached
+#define bpf_rbtree_for_each_entry_safe(pos, n, root) \
+	for (pos = rb_first_cached(root); \
+		pos && ({ n = rb_next(pos); 1; }); \
+		pos = n)
 
 void bpf_rb_root_free(const struct btf_field *field, void *rb_root,
 		      struct bpf_spin_lock *spin_lock)
@@ -2094,11 +2168,132 @@ __bpf_kfunc int bpf_rbtree_add_impl(struct bpf_rb_root *root, struct bpf_rb_node
 	return __bpf_rbtree_add(root, n, (void *)less, meta ? meta->record : NULL, off);
 }
 
+static struct bpf_rb_node * __bpf_rbtree_search(struct bpf_rb_root *root,
+			    struct bpf_rb_node_kern *node, void *bpf_cb,
+				struct btf_record *rec, u64 off)
+{
+	struct rb_root_cached *r = (void *)root;
+	struct rb_node *pos, *n;
+	bpf_callback_t cb = (bpf_callback_t)bpf_cb;
+	bool found = false;
+
+	bpf_rbtree_for_each_entry_safe(pos, n, r) {
+		if (cb((uintptr_t)node, (uintptr_t)pos, 0, 0, 0)) {
+			found = true;
+			break;
+		}
+	}
+
+	/* Drop the input node */
+	n = &node->rb_node;
+	__bpf_obj_drop_impl((void *)n - off, rec);
+
+	return found ? (struct bpf_rb_node *)pos : NULL;
+}
+
+static struct bpf_rb_node * __bpf_rbtree_search_less(struct bpf_rb_root *root,
+			    struct bpf_rb_node_kern *node, void *less,
+				struct btf_record *rec, u64 off)
+{
+	struct bpf_rb_node_kern *orig_node = node;
+	struct rb_root_cached *r = (void *)root;
+	struct rb_node *pos, *n;
+	bpf_callback_t cb = (bpf_callback_t)less;
+	bool found = false;
+
+	bpf_rbtree_postorder_for_each_entry_safe(pos, n, &r->rb_root) {
+		if (!cb((uintptr_t)node, (uintptr_t)pos, 0, 0, 0)) {
+			node = container_of(pos, struct bpf_rb_node_kern, rb_node);
+			found = true;
+		}
+	}
+
+	/* Drop the input node */
+	n = &orig_node->rb_node;
+	__bpf_obj_drop_impl((void *)n - off, rec);
+
+	return found ? (struct bpf_rb_node *)node : NULL;
+}
+
+static struct bpf_rb_node * __bpf_rbtree_lower_bound_impl(struct bpf_rb_root *root,
+			    struct bpf_rb_node_kern *node, void *less,
+				struct btf_record *rec, u64 off)
+{
+	struct rb_node **link = &((struct rb_root_cached *)root)->rb_root.rb_node;
+	struct rb_node *parent = NULL, *n = &node->rb_node;
+	struct rb_node *ret_node = NULL;
+	bpf_callback_t cb = (bpf_callback_t)less;
+	bool cmp_val = 0;
+
+	while (*link) {
+		parent = *link;
+		cmp_val = cb((uintptr_t)node, (uintptr_t)parent, 0, 0, 0);
+		if (cmp_val == false) {
+			link = &parent->rb_right;
+		} else {
+			ret_node = parent;
+			link = &parent->rb_left;
+		}
+	}
+
+	/* Drop the input node */
+	n = &node->rb_node;
+	__bpf_obj_drop_impl((void *)n - off, rec);
+
+	return (ret_node == NULL) ? NULL : (struct bpf_rb_node *)ret_node;
+}
+
+__bpf_kfunc struct bpf_rb_node *bpf_rbtree_lower_bound_impl(struct bpf_rb_root *root, struct bpf_rb_node *node,
+				    bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
+					void *meta__ign, u64 off)
+{
+	struct btf_struct_meta *meta = meta__ign;
+	struct bpf_rb_node_kern *n = (void *)node;
+	return __bpf_rbtree_lower_bound_impl(root, n, (void *)less, meta ? meta->record : NULL, off);
+}
+
+/**
+ * bpf_rbtree_search_impl - Search in order for the first node in a red-black tree whose content satisfy something.
+ * The input node is dropped regardless of whether.
+ */
+__bpf_kfunc struct bpf_rb_node *bpf_rbtree_search_impl(struct bpf_rb_root *root, struct bpf_rb_node *node,
+				    bool (bpf_cb)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
+					void *meta__ign, u64 off)
+{
+	struct btf_struct_meta *meta = meta__ign;
+	struct bpf_rb_node_kern *n = (void *)node;
+	return __bpf_rbtree_search(root, n, (void *)bpf_cb, meta ? meta->record : NULL, off);
+}
+
+/**
+ * bpf_rbtree_search_less_impl - Search for a node in a red-black tree whose content
+ * is the smallest. The input node is dropped regardless of whether.
+ */
+__bpf_kfunc struct bpf_rb_node *bpf_rbtree_search_less_impl(struct bpf_rb_root *root, struct bpf_rb_node *node,
+				    bool (less)(struct bpf_rb_node *a, const struct bpf_rb_node *b),
+					void *meta__ign, u64 off)
+{
+	struct btf_struct_meta *meta = meta__ign;
+	struct bpf_rb_node_kern *n = (void *)node;
+	return __bpf_rbtree_search_less(root, n, (void *)less, meta ? meta->record : NULL, off);
+}
+
 __bpf_kfunc struct bpf_rb_node *bpf_rbtree_first(struct bpf_rb_root *root)
 {
 	struct rb_root_cached *r = (struct rb_root_cached *)root;
 
 	return (struct bpf_rb_node *)rb_first_cached(r);
+}
+
+__bpf_kfunc struct bpf_rb_node *bpf_rbtree_next(struct bpf_rb_root *root, struct bpf_rb_node *node)
+{
+	struct bpf_rb_node_kern *node_internal = (struct bpf_rb_node_kern *)node;
+	struct rb_node *n = &node_internal->rb_node;
+
+	if (READ_ONCE(node_internal->owner) != root)
+		return NULL;
+
+	return (struct bpf_rb_node *)rb_next(n);
 }
 
 /**
@@ -2284,6 +2479,17 @@ __bpf_kfunc void *bpf_dynptr_slice(const struct bpf_dynptr_kern *ptr, u32 offset
 		bpf_xdp_copy_buf(ptr->data, ptr->offset + offset, buffer__opt, len, false);
 		return buffer__opt;
 	}
+	case BPF_DYNPTR_TYPE_XDP_FRAME:
+	{
+		void *xdp_ptr = bpf_xdp_frame_pointer(ptr->data, ptr->offset + offset, len);
+		if (!IS_ERR_OR_NULL(xdp_ptr))
+			return xdp_ptr;
+
+		if (!buffer__opt)
+			return NULL;
+		bpf_xdp_copy_frame(ptr->data, ptr->offset + offset, buffer__opt, len, false);
+		return buffer__opt;
+	}
 	default:
 		WARN_ONCE(true, "unknown dynptr type %d\n", type);
 		return NULL;
@@ -2451,8 +2657,12 @@ BTF_ID_FLAGS(func, bpf_list_pop_back, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_task_acquire, KF_ACQUIRE | KF_RCU | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_task_release, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_rbtree_remove, KF_ACQUIRE | KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_rbtree_lower_bound_impl, KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_rbtree_search_impl, KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_rbtree_search_less_impl, KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_rbtree_add_impl)
 BTF_ID_FLAGS(func, bpf_rbtree_first, KF_RET_NULL)
+BTF_ID_FLAGS(func, bpf_rbtree_next, KF_RET_NULL)
 
 #ifdef CONFIG_CGROUPS
 BTF_ID_FLAGS(func, bpf_cgroup_acquire, KF_ACQUIRE | KF_RCU | KF_RET_NULL)
@@ -2522,6 +2732,9 @@ static int __init kfunc_init(void)
 	ret = ret ?: register_btf_id_dtor_kfuncs(generic_dtors,
 						  ARRAY_SIZE(generic_dtors),
 						  THIS_MODULE);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP, &generic_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP_EGRESS, &generic_kfunc_set);
+	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_XDP_GEN, &generic_kfunc_set);
 	return ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &common_kfunc_set);
 }
 

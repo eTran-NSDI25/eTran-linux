@@ -944,6 +944,7 @@ enum bpf_map_type {
 	BPF_MAP_TYPE_BLOOM_FILTER,
 	BPF_MAP_TYPE_USER_RINGBUF,
 	BPF_MAP_TYPE_CGRP_STORAGE,
+	BPF_MAP_TYPE_PKT_QUEUE,
 };
 
 /* Note that tracing related programs such as
@@ -962,6 +963,8 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_SCHED_ACT,
 	BPF_PROG_TYPE_TRACEPOINT,
 	BPF_PROG_TYPE_XDP,
+    BPF_PROG_TYPE_XDP_EGRESS,
+    BPF_PROG_TYPE_XDP_GEN,
 	BPF_PROG_TYPE_PERF_EVENT,
 	BPF_PROG_TYPE_CGROUP_SKB,
 	BPF_PROG_TYPE_CGROUP_SOCK,
@@ -1327,6 +1330,13 @@ enum {
 /* If set, XDP frames will be transmitted after processing */
 #define BPF_F_TEST_XDP_LIVE_FRAMES	(1U << 1)
 
+/* Flags for BPF_MAP_TYPE_PIFO_* */
+
+/* Used for flags argument of bpf_map_push_elem(); reserve top four bits for
+ * actual flags, the rest is the enqueue priority
+ */
+#define BPF_PIFO_PRIO_MASK	(~0ULL >> 4)
+
 /* type for BPF_ENABLE_STATS */
 enum bpf_stats_type {
 	/* enabled run_time_ns and run_cnt */
@@ -1381,6 +1391,10 @@ union bpf_attr {
 		 * BPF_MAP_TYPE_BLOOM_FILTER - the lowest 4 bits indicate the
 		 * number of hash functions (if 0, the bloom filter will default
 		 * to using 5 hash functions).
+		 *
+		 * BPF_MAP_TYPE_PIFO_* - the lower 32 bits indicate the valid
+		 * range of priorities for entries enqueued in the map. Must be
+		 * a power of two.
 		 */
 		__u64	map_extra;
 	};
@@ -6300,6 +6314,8 @@ struct xdp_md {
 	__u32 rx_queue_index;  /* rxq->queue_index  */
 
 	__u32 egress_ifindex;  /* txq->dev->ifindex */
+
+    __u32 umem_id;
 };
 
 /* DEVMAP map-value layout
@@ -7300,9 +7316,23 @@ struct bpf_core_relo {
  * Flags to control bpf_timer_start() behaviour.
  *     - BPF_F_TIMER_ABS: Timeout passed is absolute time, by default it is
  *       relative to current time.
+ *     - BPF_F_TIMER_IMMEDIATE: Timer callback is called immediately. Only
+ *       valid for net_tx timers
+ *	   - BPF_F_TIMER_PACER: Callback is called by a dedicated pacer kthread,
+ *       when is set, ignore BPF_F_TIMER_IMMEDIATE flag.
+ *	   - BPF_F_TIMER_PACER_WAKEUP: wakeup the pacer kthread.
+  *	   - BPF_F_TIMER_PACER_CONTINUE: notify pacer kthread to continue.
  */
 enum {
 	BPF_F_TIMER_ABS = (1ULL << 0),
+	BPF_F_TIMER_IMMEDIATE = (1ULL << 2),
+	BPF_F_TIMER_PACER = (1ULL << 3),
+	BPF_F_TIMER_PACER_WAKEUP = (1ULL << 4),
+	BPF_F_TIMER_PACER_CONTINUE = (1ULL << 5),
+};
+
+enum {
+	BPF_F_TIMER_NET_TX = 16,
 };
 
 /* BPF numbers iterator state */

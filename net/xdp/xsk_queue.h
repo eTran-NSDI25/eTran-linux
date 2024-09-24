@@ -42,6 +42,8 @@ struct xsk_queue {
 	u32 nentries;
 	u32 cached_prod;
 	u32 cached_cons;
+    /* only used by cq for ooo completion (before cached_prod) */
+    u32 ooo_comp_prod;
 	struct xdp_ring *ring;
 	u64 invalid_descs;
 	u64 queue_empty_descs;
@@ -137,13 +139,18 @@ static inline bool xskq_cons_read_addr_unchecked(struct xsk_queue *q, u64 *addr)
 
 static inline bool xp_unused_options_set(u32 options)
 {
-	return options & ~XDP_PKT_CONTD;
+	return options & ~(XDP_PKT_CONTD |
+		XDP_EGRESS_FWD | XDP_EGRESS_SKIP | XDP_EGRESS_NO_COMP);
 }
 
 static inline bool xp_aligned_validate_desc(struct xsk_buff_pool *pool,
 					    struct xdp_desc *desc)
 {
 	u64 offset = desc->addr & (pool->chunk_size - 1);
+
+    if (unlikely(pool->xdp_egress_prog &&
+		(offset != XDP_PACKET_HEADROOM + pool->headroom)))
+		return false;
 
 	if (!desc->len)
 		return false;
@@ -390,6 +397,13 @@ static inline int xskq_prod_reserve_addr(struct xsk_queue *q, u64 addr)
 	/* A, matches D */
 	ring->desc[q->cached_prod++ & q->ring_mask] = addr;
 	return 0;
+}
+
+static inline void xskq_prod_write_addr_ooo(struct xsk_queue *q, u64 addr)
+{
+    struct xdp_umem_ring *ring = (struct xdp_umem_ring *)q->ring;
+
+    ring->desc[q->ooo_comp_prod++ & q->ring_mask] = addr;
 }
 
 static inline void xskq_prod_write_addr_batch(struct xsk_queue *q, struct xdp_desc *descs,

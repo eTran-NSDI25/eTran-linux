@@ -11078,6 +11078,11 @@ static u32 xdp_gen_convert_ctx_access(enum bpf_access_type type,
 		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
 				      offsetof(struct net_device, ifindex));
 		break;
+    case offsetof(struct xdp_md, umem_id):
+		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, umem_id),
+				      si->dst_reg, si->src_reg,
+				      offsetof(struct xdp_buff, umem_id));
+		break;
 	}
 
 	return insn - insn_buf;

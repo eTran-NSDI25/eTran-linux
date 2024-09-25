@@ -92,7 +92,7 @@ struct xdp_sock {
 	struct xsk_queue *cq_tmp; /* Only as tmp storage before bind */
 
 	/* XDP_GEN */
-	struct xdp_gen_data *bxd;
+	struct xdp_gen_data *xgd;
 };
 
 #ifdef CONFIG_XDP_SOCKETS

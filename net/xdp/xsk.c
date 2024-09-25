@@ -408,7 +408,7 @@ int __xsk_map_redirect(struct xdp_sock *xs, struct xdp_buff *xdp)
 static void xdp_gen_init_page(struct page *page, void *arg)
 {
 	struct xdp_gen_page_head *page_head = phys_to_virt(page_to_phys(page));
-	struct xdp_gen_data *bxd = (struct xdp_gen_data *)arg;
+	struct xdp_gen_data *xgd = (struct xdp_gen_data *)arg;
 	u32 headroom = XDP_PACKET_HEADROOM;
 	size_t frm_len = XDP_GEN_FRAME_LEN;
 	size_t meta_len = 0;
@@ -417,7 +417,7 @@ static void xdp_gen_init_page(struct page *page, void *arg)
 	void *hard_start = page_head->data;
 
 	/* initialize struct xdp_buff ctx in this page */
-	xdp_init_buff(ctx, PAGE_SIZE - sizeof(struct xdp_gen_page_head), &bxd->rxq);
+	xdp_init_buff(ctx, PAGE_SIZE - sizeof(struct xdp_gen_page_head), &xgd->rxq);
 	xdp_prepare_buff(ctx, hard_start, headroom, frm_len, true);
 	ctx->data = ctx->data_meta + meta_len;
 
@@ -444,7 +444,7 @@ static void xdp_gen_reset_ctx(struct xdp_gen_page_head *page_head)
 	page_head->ctx.data_end = page_head->template_ctx.data_end;
 }
 
-static void __run_xdp_gen(struct xdp_gen_data *bxd, struct bpf_prog *xdp_gen_prog,
+static void __run_xdp_gen(struct xdp_gen_data *xgd, struct bpf_prog *xdp_gen_prog,
 				u32 repeat)
 {
 	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
@@ -461,7 +461,7 @@ static void __run_xdp_gen(struct xdp_gen_data *bxd, struct bpf_prog *xdp_gen_pro
 	xdp_set_return_frame_no_direct();
 
 	for (i = 0; i < repeat; i++) {
-		page = page_pool_dev_alloc_pages(bxd->pp);
+		page = page_pool_dev_alloc_pages(xgd->pp);
 		if (!page) {
 			pr_warn("Failed to allocate page for XDP_GEN\n");
 			goto out;
@@ -478,13 +478,13 @@ static void __run_xdp_gen(struct xdp_gen_data *bxd, struct bpf_prog *xdp_gen_pro
 		switch (act) {
 			case XDP_TX:
 				/* emulate BPF_CALL_2(bpf_xdp_redirect, u32, ifindex, u64, flags) */
-				ri->tgt_index = bxd->dev->ifindex;
+				ri->tgt_index = xgd->dev->ifindex;
 				ri->map_id = INT_MAX;
 				ri->map_type = BPF_MAP_TYPE_UNSPEC;
 				fallthrough;
 			case XDP_REDIRECT:
 				frame = xdp_convert_buff_to_frame(ctx);
-				if (unlikely(xdp_do_redirect_frame(bxd->dev, ctx, frame, xdp_gen_prog)))
+				if (unlikely(xdp_do_redirect_frame(xgd->dev, ctx, frame, xdp_gen_prog)))
 					xdp_return_buff(ctx);
 				else
 					flush++;
@@ -517,12 +517,12 @@ out:
 static void run_xdp_gen(struct xdp_sock *xs)
 {
 	struct bpf_prog *xdp_gen_prog = xs->pool->xdp_gen_prog;
-	struct xdp_gen_data *bxd = xs->bxd;
+	struct xdp_gen_data *xgd = xs->xgd;
 
-	if (!xdp_gen_prog || !bxd)
+	if (!xdp_gen_prog || !xgd)
 		return;
 
-	__run_xdp_gen(bxd, xdp_gen_prog, MAX_XDP_GEN_PKT);
+	__run_xdp_gen(xgd, xdp_gen_prog, MAX_XDP_GEN_PKT);
 }
 
 void add_lb_flush(struct xsk_buff_pool *pool)
@@ -1381,10 +1381,10 @@ static int xsk_release(struct socket *sock)
 	mutex_lock(&xs->mutex);
 
 	/* Release XDP_GEN resources binding to this socket */
-	if (xs->bxd) {
-		xdp_unreg_mem_model(&xs->bxd->mem);
-		page_pool_destroy(xs->bxd->pp);
-		kfree(xs->bxd);
+	if (xs->xgd) {
+		xdp_unreg_mem_model(&xs->xgd->mem);
+		page_pool_destroy(xs->xgd->pp);
+		kfree(xs->xgd);
 	}
 
 	xsk_unbind_dev(xs);
@@ -1428,16 +1428,16 @@ static bool xsk_validate_queues(struct xdp_sock *xs)
 static int init_xdp_gen(struct xdp_sock *xs)
 {
 	int err = -ENOMEM;
-	struct xdp_gen_data *bxd;
+	struct xdp_gen_data *xgd;
 	struct page_pool *pp;
 	struct net_device *netdev = xs->pool->netdev;
 	u32 queue_id = (u32)xs->queue_id;
 
-	xs->bxd = kzalloc(sizeof(struct xdp_gen_data), GFP_KERNEL);
-	if (!xs->bxd)
+	xs->xgd = kzalloc(sizeof(struct xdp_gen_data), GFP_KERNEL);
+	if (!xs->xgd)
 		return err;
 
-	bxd = xs->bxd;
+	xgd = xs->xgd;
 
 	struct page_pool_params pp_params = {
 		.order = 0,
@@ -1445,30 +1445,30 @@ static int init_xdp_gen(struct xdp_sock *xs)
 		.pool_size = MAX_XDP_GEN_PKT << 1,
 		.nid = dev_to_node(xs->pool->dev),
 		.init_callback = xdp_gen_init_page,
-		.init_arg = bxd,
+		.init_arg = xgd,
 	};
 
 	pp = page_pool_create(&pp_params);
 	if (IS_ERR(pp))
 		goto err_1;
 
-	err = xdp_reg_mem_model(&bxd->mem, MEM_TYPE_PAGE_POOL, pp);
+	err = xdp_reg_mem_model(&xgd->mem, MEM_TYPE_PAGE_POOL, pp);
 	if (err)
 		goto err_2;
 
-	bxd->pp = pp;
+	xgd->pp = pp;
 
-	xdp_rxq_info_reg(&bxd->rxq, netdev, queue_id, 0);
+	xdp_rxq_info_reg(&xgd->rxq, netdev, queue_id, 0);
 
-	bxd->rxq.mem.type = MEM_TYPE_PAGE_POOL;
-	bxd->rxq.mem.id = pp->xdp_mem_id;
-	bxd->dev = netdev;
+	xgd->rxq.mem.type = MEM_TYPE_PAGE_POOL;
+	xgd->rxq.mem.id = pp->xdp_mem_id;
+	xgd->dev = netdev;
 
 	return 0;
 err_2:
 	page_pool_destroy(pp);
 err_1:
-	kfree(bxd);
+	kfree(xgd);
 	return err;
 }
 

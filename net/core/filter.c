@@ -11020,8 +11020,6 @@ static bool xdp_gen_is_valid_access(int off, int size,
 	case offsetof(struct xdp_md, data_end):
 		info->reg_type = PTR_TO_PACKET_END;
 		break;
-    case offsetof(struct xdp_md, umem_id):
-        return false;
 	}
 
 	return __is_valid_xdp_access(off, size);

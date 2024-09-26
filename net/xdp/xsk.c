@@ -1931,6 +1931,8 @@ static int xsk_getsockopt(struct socket *sock, int level, int optname,
 		mutex_lock(&xs->mutex);
 		if (xs->zc)
 			opts.flags |= XDP_OPTIONS_ZEROCOPY;
+        /* Get UMEM ID */
+        opts.umem_id = xs->umem->id;
 		mutex_unlock(&xs->mutex);
 
 		len = sizeof(opts);

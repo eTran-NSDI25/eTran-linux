@@ -97,6 +97,7 @@ struct xdp_statistics {
 
 struct xdp_options {
 	__u32 flags;
+    __u32 umem_id;
 };
 
 /* Flags for the flags field of struct xdp_options */

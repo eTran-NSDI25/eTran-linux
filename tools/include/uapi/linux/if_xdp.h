@@ -97,6 +97,7 @@ struct xdp_statistics {
 
 struct xdp_options {
 	__u32 flags;
+    __u32 umem_id;
 };
 
 /* Flags for the flags field of struct xdp_options */
@@ -129,12 +130,14 @@ struct xdp_desc {
 
 /*
  * Only used for case that forwarding packets between two XSKs.
- * 1) NIC driver uses it to determine if this packet is redirected to another XSK
- * 2) User space uses it to determine if this packet is received from another XSK
+ * Userspace uses it to determine if this packet is received from another XSK
 */
 #define XDP_EGRESS_FWD (1 << 1)
 
-/* User space uses it to determine if this packet is dropped by XDP_EGRESS */
+/* When NIC driver encounters this flag, it should skip processing this descriptor,
+ * and xsk_tx_release() should be called
+ * This flag is only used internally by the kernel, this flag set by userspace will be ignored
+ */
 #define XDP_EGRESS_SKIP (1 << 2)
 
 /* If this flag is set, there is no completion event for this queued packet */

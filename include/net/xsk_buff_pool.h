@@ -62,10 +62,14 @@ struct xsk_buff_pool {
 	struct list_head xskb_list;
 	struct list_head lb_list;
 	struct list_head lb_flush_node;
+    struct list_head xdp_gen_flush_node;
 	u32 heads_cnt;
 	u16 queue_id;
 
+    /* XDP_GEN */
 	struct bpf_prog *xdp_gen_prog;
+	struct xdp_gen_data *xgd;
+    
 
 	/* Data path members as close to free_heads at the end as possible. */
 	struct xsk_queue *fq ____cacheline_aligned_in_smp;

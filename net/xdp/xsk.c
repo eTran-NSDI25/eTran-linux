@@ -39,6 +39,7 @@
 
 static DEFINE_PER_CPU(struct list_head, xskmap_flush_list);
 static DEFINE_PER_CPU(struct list_head, lb_flush_list);
+static DEFINE_PER_CPU(struct list_head, xdp_gen_flush_list);
 
 void xsk_set_rx_need_wakeup(struct xsk_buff_pool *pool)
 {
@@ -514,10 +515,10 @@ out:
 	xdp_clear_return_frame_no_direct();
 }
 
-static void run_xdp_gen(struct xdp_sock *xs)
+static void run_xdp_gen(struct xsk_buff_pool *pool)
 {
-	struct bpf_prog *xdp_gen_prog = xs->pool->xdp_gen_prog;
-	struct xdp_gen_data *xgd = xs->xgd;
+	struct bpf_prog *xdp_gen_prog = pool->xdp_gen_prog;
+	struct xdp_gen_data *xgd = pool->xgd;
 
 	if (!xdp_gen_prog || !xgd)
 		return;
@@ -525,11 +526,18 @@ static void run_xdp_gen(struct xdp_sock *xs)
 	__run_xdp_gen(xgd, xdp_gen_prog, MAX_XDP_GEN_PKT);
 }
 
+static inline void add_xdp_gen_flush(struct xsk_buff_pool *pool)
+{
+    struct list_head *fl = this_cpu_ptr(&xdp_gen_flush_list);
+    if (!pool->xdp_gen_flush_node.prev)
+        list_add(&pool->xdp_gen_flush_node, fl);
+}
+
 void add_lb_flush(struct xsk_buff_pool *pool)
 {
-	struct list_head *flush_list = this_cpu_ptr(&lb_flush_list);
+	struct list_head *fl = this_cpu_ptr(&lb_flush_list);
 	if (!pool->lb_flush_node.prev)
-		list_add(&pool->lb_flush_node, flush_list);
+		list_add(&pool->lb_flush_node, fl);
 }
 
 void __xsk_map_flush_raw(void)
@@ -547,18 +555,20 @@ void __xsk_map_flush(void)
 {
 	struct list_head *flush_list = this_cpu_ptr(&xskmap_flush_list);
 	struct xsk_buff_pool *pool, *pool_tmp;
-	bool xdp_gen = false;
 
 	struct xdp_sock *xs, *tmp;
 	list_for_each_entry_safe(xs, tmp, flush_list, flush_node) {
 		xsk_flush(xs);
-		// TODO: this should be done per netdev for multi-NIC case.
-		if (!xdp_gen) {
-			run_xdp_gen(xs);
-			xdp_gen = true;
-		}
 		__list_del_clearprev(&xs->flush_node);
+        add_xdp_gen_flush(xs->pool);
 	}
+    
+    /* XDP_GEN */
+    flush_list = this_cpu_ptr(&xdp_gen_flush_list);
+    list_for_each_entry_safe(pool, pool_tmp, flush_list, xdp_gen_flush_node) {
+        run_xdp_gen(pool);
+        __list_del_clearprev(&pool->xdp_gen_flush_node);
+    }
 
 	/* When xsk load balancing is enabled, packets allocated
 	 * from this CPU's FQ are redirect to another CPU.
@@ -1379,14 +1389,6 @@ static int xsk_release(struct socket *sock)
 
 	xsk_delete_from_maps(xs);
 	mutex_lock(&xs->mutex);
-
-	/* Release XDP_GEN resources binding to this socket */
-	if (xs->xgd) {
-		xdp_unreg_mem_model(&xs->xgd->mem);
-		page_pool_destroy(xs->xgd->pp);
-		kfree(xs->xgd);
-	}
-
 	xsk_unbind_dev(xs);
 	mutex_unlock(&xs->mutex);
 
@@ -1425,25 +1427,25 @@ static bool xsk_validate_queues(struct xdp_sock *xs)
 	return xs->fq_tmp && xs->cq_tmp;
 }
 
-static int init_xdp_gen(struct xdp_sock *xs)
+static int init_xdp_gen(struct xsk_buff_pool *pool)
 {
 	int err = -ENOMEM;
 	struct xdp_gen_data *xgd;
 	struct page_pool *pp;
-	struct net_device *netdev = xs->pool->netdev;
-	u32 queue_id = (u32)xs->queue_id;
+	struct net_device *netdev = pool->netdev;
+	u32 queue_id = (u32)pool->queue_id;
 
-	xs->xgd = kzalloc(sizeof(struct xdp_gen_data), GFP_KERNEL);
-	if (!xs->xgd)
+	pool->xgd = kzalloc(sizeof(struct xdp_gen_data), GFP_KERNEL);
+	if (!pool->xgd)
 		return err;
 
-	xgd = xs->xgd;
+	xgd = pool->xgd;
 
 	struct page_pool_params pp_params = {
 		.order = 0,
 		.flags = 0,
 		.pool_size = MAX_XDP_GEN_PKT << 1,
-		.nid = dev_to_node(xs->pool->dev),
+		.nid = dev_to_node(pool->dev),
 		.init_callback = xdp_gen_init_page,
 		.init_arg = xgd,
 	};
@@ -1668,15 +1670,16 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 		else {
 			printk(KERN_INFO "XDP_GEN has been loaded.\n");
 		}
+        
+        /* Initialize once */
+        if (!xs->pool->xgd) {
+            err = init_xdp_gen(xs->pool);
+            if (err)
+                pr_warn("Failed to prepare frames for XDP_GEN\n");
+            else
+                printk(KERN_INFO "Frames for XDP_GEN has been prepared successfully.\n");
+        }
 
-	}
-
-	if (xs->pool->xdp_gen_prog) {
-		err = init_xdp_gen(xs);
-		if (err)
-			pr_warn("Failed to init batch xdp for this xsk\n");
-		else
-			printk(KERN_INFO "Batch XDP has been initialized successfully for this xsk.\n");
 	}
 
 out_unlock:
@@ -2154,6 +2157,7 @@ static int __init xsk_init(void)
 	for_each_possible_cpu(cpu) {
 		INIT_LIST_HEAD(&per_cpu(xskmap_flush_list, cpu));
 		INIT_LIST_HEAD(&per_cpu(lb_flush_list, cpu));
+		INIT_LIST_HEAD(&per_cpu(xdp_gen_flush_list, cpu));
 	}
 	return 0;
 

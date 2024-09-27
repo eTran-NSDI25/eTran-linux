@@ -3,6 +3,7 @@
 #include <net/xsk_buff_pool.h>
 #include <net/xdp_sock.h>
 #include <net/xdp_sock_drv.h>
+#include <net/page_pool/helpers.h>
 
 #include "xsk_queue.h"
 #include "xdp_umem.h"
@@ -36,6 +37,13 @@ void xp_destroy(struct xsk_buff_pool *pool)
 {
 	if (!pool)
 		return;
+    
+    /* Release XDP_GEN resources binding to this pool */
+	if (pool->xgd) {
+		xdp_unreg_mem_model(&pool->xgd->mem);
+		page_pool_destroy(pool->xgd->pp);
+		kfree(pool->xgd);
+	}
 
 	kvfree(pool->tx_descs);
 	kvfree(pool->heads);

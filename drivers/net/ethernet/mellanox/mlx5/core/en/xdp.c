@@ -744,7 +744,6 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
 
 	xdp_flush_frame_bulk(&bq);
 
-	/* sq->xsk_pool is valid */
 	if (xsk_frames)
 		xsk_tx_completed(sq->channel->xsksq.xsk_pool, xsk_frames);
 

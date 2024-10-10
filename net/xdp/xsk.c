@@ -633,19 +633,18 @@ enum xdp_egress_state {
 /*
     *  |----------------------AF_XDP TX Frame Layout-------------------------|
     *
-    *  |-------XDP_PACKET_HEADROOM-------|
+    *                       |-------XDP_PACKET_HEADROOM-------|
     *
-    *  |struct xdp_frame|################|---pool->headroom---|----packet----|
+    *  |---pool->headroom---|struct xdp_frame|################|----packet----|
     *  |---pool->headroom---|
-    *	                     ^	          ^                    ^    		  ^
-    *	         data_hard_start(void*)  data_meta(void*)	 data(void*)    data_end(void*)
+    *	                    ^	                    ^         ^              ^
+    *	         data_hard_start(void*)     data_meta(void*) data(void*)    data_end(void*)
     *
-    *  orig_addr(u64)							         desc->addr(u64)
+    *  orig_addr(u64)				         desc->addr(u64)
     *
     *
     *	- XDP_PACKET_HEADROOM is defined as 256 in linux/bpf.h
     *	- pool->headroom is provided by the user
-    *  very strange, xp_init_xskb_addr() set data_hard_start = orig_addr + pool->headroom, it is potential a BUG.
 */
 
 static inline enum xdp_egress_state

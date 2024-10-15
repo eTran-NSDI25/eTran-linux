@@ -324,6 +324,15 @@ static void xp_release_deferred(struct work_struct *work)
 		printk(KERN_INFO "XDP_GEN has been unloaded.\n");
 	}
 
+    /*
+     * TODO: We should remove all frames in BPF_MAP_TYPE_PKT_QUEUE before we destroy the pool.
+     * Here we can refer to how xsk_delete_from_maps() deletes the AF_XDP socket from all maps.
+     * Solution:
+     * 1) "Link" the pool with the map when first time we add a frame to the map
+     * 2) Traverse all frames in the map and remove them here
+     * 3) Unlink the pool with the map
+    */
+
 	xdp_put_umem(pool->umem, false);
 	xp_destroy(pool);
 }

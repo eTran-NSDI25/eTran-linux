@@ -41,6 +41,18 @@ static DEFINE_PER_CPU(struct list_head, xskmap_flush_list);
 static DEFINE_PER_CPU(struct list_head, lb_flush_list);
 static DEFINE_PER_CPU(struct list_head, xdp_gen_flush_list);
 
+void xsk_ooo_cq(struct xsk_queue *cq, u64 addr)
+{
+    xskq_prod_write_addr_ooo(cq, addr);
+}
+EXPORT_SYMBOL(xsk_ooo_cq);
+
+void xsk_no_comp_err_cq(struct xsk_queue *cq)
+{
+    xskq_prod_reserve(cq);
+}
+EXPORT_SYMBOL(xsk_no_comp_err_cq);
+
 void xsk_set_rx_need_wakeup(struct xsk_buff_pool *pool)
 {
 	if (pool->cached_need_wakeup & XDP_WAKEUP_RX)
@@ -582,12 +594,6 @@ void __xsk_map_flush(void)
 	}
 }
 
-void xsk_ooo_cq(struct xsk_queue *cq, u64 addr)
-{
-    xskq_prod_write_addr_ooo(cq, addr);
-}
-EXPORT_SYMBOL(xsk_ooo_cq);
-
 void xsk_tx_completed(struct xsk_buff_pool *pool, u32 nb_entries)
 {
 	xskq_prod_submit_n(pool->cq, nb_entries);
@@ -661,13 +667,12 @@ xdp_egress_handle(struct xsk_buff_pool *pool, struct xdp_desc *desc)
     /* Locate the xskb from pre-allocated xskb pool (tx_heads) according to addr */
     xdp = &pool->tx_heads[xp_aligned_extract_idx(pool, desc->addr)].xdp;
 
-    if (desc->options & XDP_EGRESS_NO_COMP)
-        xdp->flags |= XDP_FLAGS_XSK_QUEUEING_NO_COMP;
-    else
-        xdp->flags &= ~XDP_FLAGS_XSK_QUEUEING_NO_COMP;
-
-    /* clear options */
-    desc->options = 0;
+    if (desc->options & XDP_EGRESS_NO_COMP) {
+		xdp->flags |= XDP_FLAGS_XSK_QUEUEING_NO_COMP;
+    }
+    else {
+		xdp->flags &= ~XDP_FLAGS_XSK_QUEUEING_NO_COMP;
+    }
 
 	net_prefetch(xdp->data);
 
@@ -680,6 +685,8 @@ xdp_egress_handle(struct xsk_buff_pool *pool, struct xdp_desc *desc)
 
 	switch (ret) {
 		case XDP_TX:
+            if (xdp->flags & XDP_FLAGS_XSK_QUEUEING_NO_COMP)
+                xskq_prod_cancel_n(pool->cq, 1);
 			return XDP_EGRESS_TX;
 		case XDP_REDIRECT:
 			/* Record map_type before xdp_do_redirect() */
@@ -714,14 +721,6 @@ xdp_egress_handle(struct xsk_buff_pool *pool, struct xdp_desc *desc)
 			return XDP_EGRESS_DROP;
 	}
 }
-
-bool xsk_tx_skip_desc(struct xdp_desc *desc)
-{
-    if (desc->options & XDP_EGRESS_SKIP)
-        return true;
-    return false;
-}
-EXPORT_SYMBOL(xsk_tx_skip_desc);
 
 bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc)
 {

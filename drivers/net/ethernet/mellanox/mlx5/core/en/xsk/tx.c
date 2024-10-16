@@ -95,6 +95,9 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
             continue;
         }
 
+        if (xsk_tx_no_comp_desc(&desc))
+            xdpi.mode = MLX5E_XDP_XMIT_MODE_XSK_NO_COMP;
+
 		xdptxd.dma_addr = xsk_buff_raw_get_dma(pool, desc.addr);
 		xdptxd.data = xsk_buff_raw_get_data(pool, desc.addr);
 		xdptxd.len = desc.len;
@@ -107,7 +110,9 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
 		if (unlikely(!ret)) {
 			if (sq->mpwqe.wqe)
 				mlx5e_xdp_mpwqe_complete(sq);
-
+            /* If we enable no completion before, we should reserve a position in CQ here */
+            if (xdpi.mode == MLX5E_XDP_XMIT_MODE_XSK_NO_COMP)
+                xsk_no_comp_err_cq(pool->cq);
 			mlx5e_xsk_tx_post_err(sq, &xdpi);
 		} else {
 			mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo, xdpi);

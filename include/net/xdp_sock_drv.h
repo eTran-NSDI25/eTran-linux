@@ -15,8 +15,8 @@
 #ifdef CONFIG_XDP_SOCKETS
 
 void xsk_ooo_cq(struct xsk_queue *cq, u64 addr);
+void xsk_no_comp_err_cq(struct xsk_queue *cq);
 void xsk_tx_completed(struct xsk_buff_pool *pool, u32 nb_entries);
-bool xsk_tx_skip_desc(struct xdp_desc *desc);
 bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc);
 u32 xsk_tx_peek_release_desc_batch(struct xsk_buff_pool *pool, u32 max);
 void xsk_tx_release(struct xsk_buff_pool *pool);
@@ -27,6 +27,25 @@ void xsk_set_tx_need_wakeup(struct xsk_buff_pool *pool);
 void xsk_clear_rx_need_wakeup(struct xsk_buff_pool *pool);
 void xsk_clear_tx_need_wakeup(struct xsk_buff_pool *pool);
 bool xsk_uses_need_wakeup(struct xsk_buff_pool *pool);
+
+static inline bool xsk_tx_skip_desc(struct xdp_desc *desc)
+{
+    if (desc->options & XDP_EGRESS_SKIP)
+        return true;
+    return false;
+}
+
+static inline bool xsk_tx_no_comp_desc(struct xdp_desc *desc)
+{
+    if (desc->options & XDP_EGRESS_NO_COMP)
+        return true;
+    return false;
+}
+
+static inline void xsk_tx_clear_desc(struct xdp_desc *desc)
+{
+    desc->options = 0;
+}
 
 static inline u32 xsk_pool_get_headroom(struct xsk_buff_pool *pool)
 {
@@ -191,13 +210,26 @@ static inline void xsk_ooo_cq(struct xsk_queue *cq, u64 addr)
 
 }
 
-static inline void xsk_tx_completed(struct xsk_buff_pool *pool, u32 nb_entries)
+static inline void xsk_no_comp_err_cq(struct xsk_queue *cq)
 {
 }
 
 static inline bool xsk_tx_skip_desc(struct xdp_desc *desc)
 {
     return false;
+}
+
+static inline bool xsk_tx_no_comp_desc(struct xdp_desc *desc)
+{
+    return false;
+}
+
+static inline void xsk_tx_clear_desc(struct xdp_desc *desc)
+{
+}
+
+static inline void xsk_tx_completed(struct xsk_buff_pool *pool, u32 nb_entries)
+{
 }
 
 static inline bool xsk_tx_peek_desc(struct xsk_buff_pool *pool,

@@ -7314,14 +7314,12 @@ struct bpf_core_relo {
  *	   - BPF_F_TIMER_PACER: Callback is called by a dedicated pacer kthread,
  *       when is set, ignore BPF_F_TIMER_IMMEDIATE flag.
  *	   - BPF_F_TIMER_PACER_WAKEUP: wakeup the pacer kthread.
-  *	   - BPF_F_TIMER_PACER_CONTINUE: notify pacer kthread to continue.
  */
 enum {
 	BPF_F_TIMER_ABS = (1ULL << 0),
 	BPF_F_TIMER_IMMEDIATE = (1ULL << 2),
 	BPF_F_TIMER_PACER = (1ULL << 3),
 	BPF_F_TIMER_PACER_WAKEUP = (1ULL << 4),
-	BPF_F_TIMER_PACER_CONTINUE = (1ULL << 5),
 };
 
 enum {

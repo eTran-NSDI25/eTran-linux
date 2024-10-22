@@ -166,7 +166,6 @@ struct task_struct *bpf_pacer_kthread = NULL;
 EXPORT_SYMBOL(bpf_pacer_kthread);
 struct bpf_timer_nettx *bpf_pacer_cb = NULL;
 DEFINE_SPINLOCK(bpf_pacer_lock);
-bool bpf_pacer_continue = false;
 bool bpf_pacer_wakeup = false;
 
 struct completion bpf_pacer_done;
@@ -3182,21 +3181,12 @@ void netif_tx_wake_queue(struct netdev_queue *dev_queue)
 }
 EXPORT_SYMBOL(netif_tx_wake_queue);
 
-int netif_tx_schedule_bpf_timer_pacer_wakeup(void)
+void netif_tx_schedule_bpf_timer_pacer_wakeup(void)
 {
 	if (!bpf_pacer_kthread)
-		return -EEXIST;
+		return;
 	WRITE_ONCE(bpf_pacer_wakeup, true);
 	wake_up_process(bpf_pacer_kthread);
-	return 0;
-}
-
-int netif_tx_schedule_bpf_timer_pacer_continue(void)
-{
-	if (!bpf_pacer_kthread)
-		return -EEXIST;
-	bpf_pacer_continue = true;
-	return 0;
 }
 
 int netif_tx_schedule_bpf_timer_pacer(struct bpf_timer_nettx *timer)
@@ -3206,9 +3196,6 @@ int netif_tx_schedule_bpf_timer_pacer(struct bpf_timer_nettx *timer)
 	int ret = 0;
 	unsigned long flags;
 
-	if (!timer->next)
-		return -EINVAL;
-
 	if (!bpf_pacer_kthread)
 		return -EEXIST;
 
@@ -3216,7 +3203,7 @@ int netif_tx_schedule_bpf_timer_pacer(struct bpf_timer_nettx *timer)
 	if (!bpf_pacer_cb)
 		bpf_pacer_cb = timer;
 	else
-		ret = -E2BIG;
+		ret = -EBUSY;
 	spin_unlock_irqrestore(&bpf_pacer_lock, flags);
 
 	return ret;
@@ -11515,8 +11502,7 @@ void bpf_pacer_xmit(void)
 	unsigned long flags;
 	int work = 0;
 
-	while (bpf_pacer_cb && bpf_pacer_continue) {
-		bpf_pacer_continue = false;
+	while (bpf_pacer_cb) {
 		spin_lock_irqsave(&bpf_pacer_lock, flags);
 		if (bpf_pacer_cb) {
 			timer = bpf_pacer_cb;
@@ -11541,14 +11527,10 @@ int bpf_pacer_main(void *data)
 	while (!bpf_pacer_exit) {
 
 		bpf_pacer_wakeup = false;
-		bpf_pacer_continue = false;
 
 		bpf_pacer_xmit();
 
-		/* eBPF program notifies explicitly that it has work to do */
-		if (bpf_pacer_continue)
-			cond_resched();
-		else if (!READ_ONCE(bpf_pacer_wakeup)) {
+		if (!READ_ONCE(bpf_pacer_wakeup)) {
 			set_current_state(TASK_INTERRUPTIBLE);
 			/* Recheck to avoid lost wake-up */
 			if (!READ_ONCE(bpf_pacer_wakeup))
@@ -11556,6 +11538,8 @@ int bpf_pacer_main(void *data)
 			else
 				__set_current_state(TASK_RUNNING);
 		}
+        if (!bpf_pacer_cb)
+            cond_resched();
 	}
 	kthread_complete_and_exit(&bpf_pacer_done, 0);
 }

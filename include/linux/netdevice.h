@@ -3333,17 +3333,13 @@ static inline int netif_tx_schedule_bpf_timer_pacer(struct bpf_timer_nettx *time
 {
 }
 
-static inline int netif_tx_schedule_bpf_timer_pacer_wakeup(void)
-{
-}
-static inline int netif_tx_schedule_bpf_timer_pacer_continue(void)
+static inline void netif_tx_schedule_bpf_timer_pacer_wakeup(void)
 {
 }
 #else
 void netif_tx_schedule_bpf_timer(struct bpf_timer_nettx *timer);
 int netif_tx_schedule_bpf_timer_pacer(struct bpf_timer_nettx *timer);
-int netif_tx_schedule_bpf_timer_pacer_wakeup(void);
-int netif_tx_schedule_bpf_timer_pacer_continue(void);
+void netif_tx_schedule_bpf_timer_pacer_wakeup(void);
 #endif
 
 /**

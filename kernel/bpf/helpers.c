@@ -1307,31 +1307,21 @@ BPF_CALL_3(bpf_timer_start, struct bpf_timer_kern *, timer, u64, nsecs, u64, fla
 
 	if (in_nmi())
 		return -EOPNOTSUPP;
-	if (flags & ~(BPF_F_TIMER_ABS | BPF_F_TIMER_IMMEDIATE | BPF_F_TIMER_PACER | BPF_F_TIMER_PACER_WAKEUP | BPF_F_TIMER_PACER_CONTINUE))
+	if (flags & ~(BPF_F_TIMER_ABS | BPF_F_TIMER_IMMEDIATE | BPF_F_TIMER_PACER | BPF_F_TIMER_PACER_WAKEUP))
 		return -EINVAL;
 	__bpf_spin_lock_irqsave(&timer->lock);
 	t = timer->timer;
 	if (!t || !t->prog ||
 	    (((flags & BPF_F_TIMER_IMMEDIATE) || (flags & BPF_F_TIMER_PACER)
-			|| (flags & BPF_F_TIMER_PACER_WAKEUP) || (flags & BPF_F_TIMER_PACER_CONTINUE)) && !t->is_net_timer)) {
+			|| (flags & BPF_F_TIMER_PACER_WAKEUP)) && !t->is_net_timer)) {
 		ret = -EINVAL;
 		goto out;
 	}
 
-	if (flags & BPF_F_TIMER_PACER_CONTINUE) {
-		ret = netif_tx_schedule_bpf_timer_pacer_continue();
-		if (ret)
-			goto out;
-	}
-
-	if (flags & BPF_F_TIMER_PACER_WAKEUP) {
-		ret = netif_tx_schedule_bpf_timer_pacer_wakeup();
-		if (ret)
-			goto out;
-	}
-
 	if (flags & BPF_F_TIMER_PACER) {
 		ret = netif_tx_schedule_bpf_timer_pacer(&t->net_timer);
+        if (flags & BPF_F_TIMER_PACER_WAKEUP)
+            netif_tx_schedule_bpf_timer_pacer_wakeup();
 		goto out;
 	}
 
